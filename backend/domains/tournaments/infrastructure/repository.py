@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from domains.payments.infrastructure.models import PaymentIntentModel
 from domains.tournaments.domain.entities import (
     Tournament,
     TournamentPairing,
@@ -65,6 +66,18 @@ class SqlAlchemyTournamentRepository(AbstractTournamentRepository):
         )
         model = result.scalar_one_or_none()
         return self._to_player(model) if model else None
+
+    async def has_confirmed_entry_payment(self, tournament_id: UUID, user_id: UUID) -> bool:
+        result = await self._session.execute(
+            select(PaymentIntentModel.id)
+            .where(
+                PaymentIntentModel.tournament_id == tournament_id,
+                PaymentIntentModel.user_id == user_id,
+                PaymentIntentModel.status == "succeeded",
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def list_players(self, tournament_id: UUID) -> list[TournamentPlayer]:
         result = await self._session.execute(

@@ -37,6 +37,10 @@ class AbstractTournamentRepository(ABC):
         ...
 
     @abstractmethod
+    async def has_confirmed_entry_payment(self, tournament_id: UUID, user_id: UUID) -> bool:
+        ...
+
+    @abstractmethod
     async def list_players(self, tournament_id: UUID) -> list[TournamentPlayer]:
         ...
 

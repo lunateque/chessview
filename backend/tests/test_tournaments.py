@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from domains.game.domain.entities import Game
 from domains.game.domain.value_objects import GameResult, GameStatus
@@ -16,6 +17,7 @@ class InMemoryTournamentRepository:
         self.pairings = {}
         self.next_round_id = 1
         self.next_pairing_id = 1
+        self.confirmed_entry_payments = set()
 
     async def create_tournament(self, tournament):
         self.tournaments[tournament.id] = tournament
@@ -83,6 +85,9 @@ class InMemoryTournamentRepository:
     async def update_pairing(self, pairing):
         return pairing
 
+    async def has_confirmed_entry_payment(self, tournament_id, user_id):
+        return (tournament_id, user_id) in self.confirmed_entry_payments
+
 
 class StubUser:
     def __init__(self, user_id, username, rating):
@@ -139,8 +144,14 @@ class InMemoryGameRepository:
     async def get_by_id(self, game_id):
         return self.games.get(game_id)
 
+    async def get_by_id_for_update(self, game_id):
+        return await self.get_by_id(game_id)
+
     async def get_active_by_user(self, user_id):
         return None
+
+    async def get_active_by_user_for_update(self, user_id):
+        return await self.get_active_by_user(user_id)
 
     async def list_active(self):
         return []
@@ -216,6 +227,28 @@ async def test_start_tournament_creates_round_one_pairings_and_bye():
 
 
 @pytest.mark.asyncio
+async def test_paid_tournament_requires_confirmed_entry_payment():
+    owner = StubUser(uuid4(), "owner", 1500)
+    guest = StubUser(uuid4(), "guest", 1480)
+    tournament_repo = InMemoryTournamentRepository()
+    user_repo = InMemoryUserRepository([owner, guest])
+    game_repo = InMemoryGameRepository()
+    game_service = StubGameService(game_repo)
+    service = TournamentService(tournament_repo, user_repo, game_repo, game_service)
+
+    tournament = await service.create_tournament(owner.id, "Paid Swiss", "5+0", entry_fee_cents=250)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.join_tournament(tournament.id, guest.id)
+    assert exc_info.value.status_code == 402
+
+    tournament_repo.confirmed_entry_payments.add((tournament.id, guest.id))
+    await service.join_tournament(tournament.id, guest.id)
+
+    assert await tournament_repo.get_player(tournament.id, guest.id) is not None
+
+
+@pytest.mark.asyncio
 async def test_owner_can_add_otb_player_without_self_registration():
     owner = StubUser(uuid4(), "owner", 1500)
     tournament_repo = InMemoryTournamentRepository()
@@ -240,6 +273,12 @@ async def test_owner_can_add_otb_player_without_self_registration():
     assert created_user.email.endswith("@otb.chessview.local")
     assert created_user.rating == 1725
     assert created_player in players
+    guest = StubUser(uuid4(), "guest", 1480)
+    user_repo.users[guest.id] = guest
+    await service.join_tournament(tournament.id, guest.id)
+    await service.start_tournament(tournament.id, owner.id)
+    created_game = next(iter(game_repo.games.values()))
+    assert created_game.rated is False
 
 
 @pytest.mark.asyncio

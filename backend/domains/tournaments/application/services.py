@@ -6,6 +6,8 @@ import re
 import secrets
 from uuid import UUID
 
+from fastapi import HTTPException, status
+
 from domains.game.application.commands import CreateGameCommand
 from domains.game.application.services import GameService
 from domains.game.domain.repository import AbstractGameRepository
@@ -168,6 +170,15 @@ class TournamentService:
         user = await self._users.get_by_id(user_id)
         if user is None:
             raise UserNotFound()
+
+        if tournament.entry_fee_cents > 0 and not await self._tournaments.has_confirmed_entry_payment(
+            tournament_id,
+            user_id,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="Tournament entry payment is required",
+            )
 
         await self._tournaments.add_player(
             TournamentPlayer(
@@ -430,18 +441,26 @@ class TournamentService:
         users: Mapping[UUID, User],
         players_by_id: dict[UUID, TournamentPlayer],
     ) -> CreateGameCommand:
-        white_rating = users.get(assignment.white_id)
-        black_rating = users.get(assignment.black_id)
+        white_user = users.get(assignment.white_id)
+        black_user = users.get(assignment.black_id)
         return CreateGameCommand(
             white_id=assignment.white_id,
             black_id=assignment.black_id,
             time_control=TournamentService._resolve_time_control(tournament),
             starting_ratings=StartingRatings(
-                white=white_rating.rating if white_rating is not None else players_by_id[assignment.white_id].seed_rating,
-                black=black_rating.rating if black_rating is not None else players_by_id[assignment.black_id].seed_rating,
+                white=white_user.rating if white_user is not None else players_by_id[assignment.white_id].seed_rating,
+                black=black_user.rating if black_user is not None else players_by_id[assignment.black_id].seed_rating,
             ),
-            rated=True,
+            rated=not (
+                TournamentService._is_otb_user(white_user) or TournamentService._is_otb_user(black_user)
+            ),
         )
+
+    @staticmethod
+    def _is_otb_user(user: User | None) -> bool:
+        if user is None:
+            return False
+        return user.password_hash.startswith("otb:") or user.email.endswith("@otb.chessview.local")
 
     @staticmethod
     def _apply_bye_assignment(player: TournamentPlayer, changed_players: dict[UUID, TournamentPlayer]) -> None:

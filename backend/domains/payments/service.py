@@ -15,6 +15,7 @@ from domains.tournaments.infrastructure.models import TournamentModel, Tournamen
 
 TERMINAL_RELEASE_STATUSES = {"failed", "cancelled", "expired"}
 SUCCESS_SCENARIOS = {"success": "succeeded", "pending": "pending", "failed": "failed", "cancelled": "cancelled", "expired": "expired", "refunded": "refunded", "disputed": "disputed"}
+TERMINAL_PAYMENT_STATUSES = TERMINAL_RELEASE_STATUSES | {"succeeded", "refunded", "disputed"}
 WALLET_CURRENCY = "CVC"
 
 
@@ -142,6 +143,10 @@ class PaymentService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
         if scenario not in SUCCESS_SCENARIOS:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported payment scenario")
+        if payment.status in TERMINAL_PAYMENT_STATUSES and not (
+            payment.status == "succeeded" and scenario == "refunded"
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Payment is already terminal")
 
         payment.scenario = scenario
         payment.status = SUCCESS_SCENARIOS[scenario]
