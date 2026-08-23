@@ -7,12 +7,14 @@ Mounted under /api/v1/chat prefix via app/main.py.
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_current_user_id, get_db
 from domains.communication.application.services import ChatService
 from domains.communication.infrastructure.repository import SqlAlchemyChatRepository
+from domains.game.infrastructure.repository import SqlAlchemyGameRepository
+from domains.identity.face_verification.service import is_game_participant
 from domains.identity.infrastructure.repository import SqlAlchemyUserRepository
 from domains.communication.presentation.schemas import ChatMessageResponse
 
@@ -27,9 +29,13 @@ def _build_service(session: AsyncSession) -> ChatService:
 async def get_messages(
     game_id: UUID,
     session: AsyncSession = Depends(get_db),
-    _user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id),
 ):
     """Get all chat messages for a game."""
+    game = await SqlAlchemyGameRepository(session).get_by_id(game_id)
+    if game is None or not is_game_participant(game, UUID(user_id)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Game access denied")
+
     service = _build_service(session)
     messages = await service.get_messages(game_id)
 

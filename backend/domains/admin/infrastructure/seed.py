@@ -5,15 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.config import settings
 from domains.identity.infrastructure.models import UserModel
-from infrastructure.security import hash_password, verify_password
-
-
-def _password_matches(plain: str, hashed: str) -> bool:
-    try:
-        return verify_password(plain, hashed)
-    except ValueError:
-        return False
-
+from infrastructure.security import hash_password
 
 async def seed_first_admin(engine: AsyncEngine) -> None:
     """Promote configured admins and ensure local admin credentials exist."""
@@ -67,9 +59,6 @@ async def seed_first_admin(engine: AsyncEngine) -> None:
                     changed = True
                 if seeded_admin.banned_at is not None:
                     seeded_admin.banned_at = None
-                    changed = True
-                if not _password_matches(seed_password, seeded_admin.password):
-                    seeded_admin.password = hash_password(seed_password)
                     changed = True
 
         if changed:

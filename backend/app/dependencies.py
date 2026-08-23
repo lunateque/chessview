@@ -29,6 +29,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def get_current_user_id(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    session: AsyncSession = Depends(get_db),
 ) -> str:
     """Extract and validate user_id from the JWT access token."""
     token = credentials.credentials
@@ -51,6 +52,21 @@ async def get_current_user_id(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token: missing subject",
+        )
+
+    try:
+        user_uuid = UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is not active",
+        ) from exc
+
+    user = await session.get(UserModel, user_uuid)
+    if user is None or user.banned_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is not active",
         )
     return user_id
 

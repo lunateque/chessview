@@ -4,9 +4,14 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
+from fastapi import status
 
 from domains.admin.infrastructure.models import AdminAuditLogModel
+from domains.communication.infrastructure.models import ChatMessageModel
+from domains.communication.presentation import router as communication_router
+from domains.game.infrastructure.models import GameModel
 from domains.admin.presentation import router as admin_router
 from domains.identity.domain.exceptions import (
     DuplicateEmail,
@@ -14,6 +19,7 @@ from domains.identity.domain.exceptions import (
     UserNotFound,
 )
 from domains.identity.infrastructure.models import UserModel
+from domains.payments.infrastructure.models import PaymentIntentModel
 from domains.identity.presentation import router as identity_router
 from domains.profiles.presentation import router as profiles_router
 from domains.puzzles.application.services import PuzzleOverview
@@ -21,6 +27,7 @@ from domains.puzzles.domain.entities import Puzzle, PuzzleAttemptState
 from domains.puzzles.domain.exceptions import PuzzleNotFound
 from domains.puzzles.domain.value_objects import PuzzleAttemptResult
 from domains.puzzles.presentation import router as puzzles_router
+from domains.tournaments.infrastructure.models import TournamentPlayerModel
 from tests.support.api import MemorySession, app_with_router
 
 
@@ -199,6 +206,131 @@ def test_identity_router_maps_service_auth_errors(monkeypatch):
         json={"refresh_token": "expired"},
     ).status_code == 401
     assert client.get("/api/v1/identity/me").status_code == 404
+
+
+def test_communication_router_requires_game_participant():
+    participant_id = uuid4()
+    outsider_id = uuid4()
+    opponent_id = uuid4()
+    game_id = uuid4()
+    session = MemorySession()
+    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    session.store[(GameModel, game_id)] = GameModel(
+        id=game_id,
+        white_id=participant_id,
+        black_id=opponent_id,
+        time_control_name="5+0",
+        initial_time_ms=300_000,
+        increment_ms=0,
+        white_time_ms=300_000,
+        black_time_ms=300_000,
+        rated=True,
+        white_rating_before=1500,
+        black_rating_before=1500,
+        status="active",
+        result=None,
+        fen="startpos",
+        pgn=None,
+        started_at=now,
+    )
+    session.store[(UserModel, participant_id)] = UserModel(
+        id=participant_id,
+        username="white",
+        email="white@example.com",
+        password="hash",
+        rating=1500,
+        role="user",
+        banned_at=None,
+        created_at=now,
+    )
+    session.store[(ChatMessageModel, 1)] = ChatMessageModel(
+        id=1,
+        game_id=game_id,
+        user_id=participant_id,
+        content="good move",
+        created_at=now,
+    )
+
+    outsider_client = TestClient(
+        app_with_router(
+            communication_router.router,
+            prefix="/api/v1/chat",
+            user_id=str(outsider_id),
+            session=session,
+        )
+    )
+    assert outsider_client.get(f"/api/v1/chat/{game_id}/messages").status_code == 403
+
+    participant_client = TestClient(
+        app_with_router(
+            communication_router.router,
+            prefix="/api/v1/chat",
+            user_id=str(participant_id),
+            session=session,
+        )
+    )
+    response = participant_client.get(f"/api/v1/chat/{game_id}/messages")
+
+    assert response.status_code == 200
+    assert response.json()[0]["content"] == "good move"
+
+
+def test_identity_public_routes_use_rate_limit(monkeypatch):
+    async def deny_rate_limit(*_args, **_kwargs):
+        return False
+
+    class IdentityService:
+        async def register(self, _command):
+            return {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "token_type": "bearer",
+                "user": identity_router._serialize_user_profile(_user_payload(uuid4())).model_dump(mode="json"),
+            }
+
+        async def login(self, _command):
+            return {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "token_type": "bearer",
+                "user": identity_router._serialize_user_profile(_user_payload(uuid4())).model_dump(mode="json"),
+            }
+
+        async def request_password_reset(self, _command):
+            return None
+
+    monkeypatch.setattr(identity_router, "check_rate_limit", deny_rate_limit, raising=False)
+    monkeypatch.setattr(identity_router, "_build_service", lambda _session: IdentityService())
+    client = TestClient(
+        app_with_router(identity_router.router, prefix="/api/v1/identity", session=object())
+    )
+
+    assert client.post(
+        "/api/v1/identity/register",
+        json={"username": "alice", "email": "alice@example.com", "password": "secret1"},
+    ).status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    assert client.post(
+        "/api/v1/identity/login",
+        json={"email": "alice@example.com", "password": "secret1"},
+    ).status_code == status.HTTP_429_TOO_MANY_REQUESTS
+    assert client.post(
+        "/api/v1/identity/password-reset/request",
+        json={"email": "alice@example.com"},
+    ).status_code == status.HTTP_429_TOO_MANY_REQUESTS
+
+
+@pytest.mark.asyncio
+async def test_identity_rate_limit_fails_open_on_redis_error(monkeypatch, caplog):
+    async def broken_rate_limit(*_args, **_kwargs):
+        raise RuntimeError("redis down")
+
+    request = SimpleNamespace(client=SimpleNamespace(host="203.0.113.10"))
+    monkeypatch.setattr(identity_router, "check_rate_limit", broken_rate_limit, raising=False)
+
+    with caplog.at_level("WARNING", logger=identity_router.logger.name):
+        await identity_router._rate_limit_identity(request)
+
+    assert "Identity rate limit unavailable" in caplog.text
 
 
 def test_profiles_router_leaderboard_search_and_head_to_head(monkeypatch):
@@ -394,53 +526,50 @@ def test_admin_router_requires_admin_and_updates_user_roles():
     assert audit.payload == {"role": "admin"}
 
 
-def test_admin_router_refund_endpoint_audits_payment_refunds(monkeypatch):
+def test_admin_router_refund_endpoint_audits_payment_refunds():
     admin_id = uuid4()
     payment_id = uuid4()
     user_id = uuid4()
+    tournament_id = uuid4()
+    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
     session = MemorySession()
+    payment = PaymentIntentModel(
+        id=payment_id,
+        user_id=user_id,
+        tournament_id=tournament_id,
+        scheduled_match_id=None,
+        amount_cents=250,
+        currency="CVC",
+        status="succeeded",
+        scenario="success",
+        reserved_until=None,
+        metadata_json={"wallet_debited": True, "wallet_amount": 250},
+        created_at=now,
+        updated_at=now,
+    )
+    user = UserModel(
+        id=user_id,
+        username="payer",
+        email="payer@example.com",
+        password="hashed",
+        rating=1500,
+        coins=750,
+        role="user",
+        banned_at=None,
+        created_at=now,
+    )
+    player = TournamentPlayerModel(
+        tournament_id=tournament_id,
+        user_id=user_id,
+        seed_rating=1500,
+        score=0,
+        status="active",
+        joined_at=now,
+    )
+    session.store[(PaymentIntentModel, payment_id)] = payment
+    session.store[(UserModel, user_id)] = user
+    session.store[(TournamentPlayerModel, (tournament_id, user_id))] = player
 
-    class PaymentService:
-        def __init__(self, provided_session) -> None:
-            assert provided_session is session
-
-        async def simulate(self, requested_payment_id, scenario):
-            assert requested_payment_id == payment_id
-            assert scenario == "refunded"
-            return SimpleNamespace(
-                id=payment_id,
-                user_id=user_id,
-                tournament_id=None,
-                scheduled_match_id=None,
-                amount_cents=250,
-                currency="CVC",
-                status="refunded",
-                scenario="refunded",
-                reserved_until=None,
-                metadata_json={"reason": "admin"},
-                created_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
-                updated_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
-            )
-
-        @staticmethod
-        def to_response(payment):
-            return {
-                "id": payment.id,
-                "user_id": payment.user_id,
-                "tournament_id": payment.tournament_id,
-                "scheduled_match_id": payment.scheduled_match_id,
-                "subject_type": "wallet",
-                "amount_cents": payment.amount_cents,
-                "currency": payment.currency,
-                "status": payment.status,
-                "scenario": payment.scenario,
-                "reserved_until": payment.reserved_until,
-                "metadata": payment.metadata_json,
-                "created_at": payment.created_at,
-                "updated_at": payment.updated_at,
-            }
-
-    monkeypatch.setattr(admin_router, "PaymentService", PaymentService)
     client = TestClient(
         app_with_router(
             admin_router.router,
@@ -454,6 +583,8 @@ def test_admin_router_refund_endpoint_audits_payment_refunds(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["status"] == "refunded"
+    assert user.coins == 1000
+    assert player.status == "withdrawn"
     audit = next(item for item in session.added if isinstance(item, AdminAuditLogModel))
     assert audit.action == "payment.refund"
     assert audit.target_id == str(payment_id)
