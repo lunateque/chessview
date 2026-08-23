@@ -59,6 +59,10 @@ def to_game_list_item(game, current_user_id: UUID, players: PlayerDirectory, mov
         result=game.result,
         status=game.status,
         termination_reason=game.termination_reason,
+        pending_draw_offer_by_user_id=(
+            str(game.pending_draw_offer_by_user_id) if game.pending_draw_offer_by_user_id is not None else None
+        ),
+        pending_draw_offer_at=game.pending_draw_offer_at,
         move_count=move_count,
         rating_delta=rating_delta_for_user(game, current_user_id),
         started_at=game.started_at,
@@ -79,6 +83,10 @@ def to_game_detail_response(game, moves: Iterable, players: PlayerDirectory, clo
         result=game.result,
         fen=game.fen,
         pgn=game.pgn,
+        pending_draw_offer_by_user_id=(
+            str(game.pending_draw_offer_by_user_id) if game.pending_draw_offer_by_user_id is not None else None
+        ),
+        pending_draw_offer_at=game.pending_draw_offer_at,
         move_count=len(move_list),
         clock=ClockStateResponse(**clock_payload),
         white_rating=rating_summary(game.white_rating_before, game.white_rating_after),

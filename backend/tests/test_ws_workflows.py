@@ -86,9 +86,17 @@ class FakeWebSocket:
         return self.messages.pop(0)
 
 
+class FakeSession:
+    def __init__(self, user=None) -> None:
+        self.user = user if user is not None else SimpleNamespace(banned_at=None)
+
+    async def get(self, _model, _key):
+        return self.user
+
+
 @asynccontextmanager
 async def fake_session_factory():
-    yield object()
+    yield FakeSession()
 
 
 @pytest.mark.asyncio
@@ -155,6 +163,83 @@ async def test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors(monk
         "NOT_YOUR_TURN",
     ]
     assert manager.disconnected == [(user_id, websocket)]
+
+
+@pytest.mark.asyncio
+async def test_ws_endpoint_rejects_banned_user_before_accept(monkeypatch):
+    user_id = str(uuid4())
+    banned_user = SimpleNamespace(banned_at=datetime.now(timezone.utc))
+
+    @asynccontextmanager
+    async def banned_session_factory():
+        yield FakeSession(banned_user)
+
+    monkeypatch.setattr(ws_entry, "decode_token", lambda _token: {"type": "access", "sub": user_id})
+    monkeypatch.setattr(ws_entry, "async_session_factory", banned_session_factory)
+
+    websocket = FakeWebSocket(token="good")
+    await ws_entry.ws_endpoint(websocket)  # type: ignore[arg-type]
+
+    assert websocket.accepted is False
+    assert websocket.closed_codes == [4001]
+
+
+@pytest.mark.asyncio
+async def test_ws_reconnect_timeout_emits_game_over_side_effects(monkeypatch):
+    user_id = uuid4()
+    game = Game(white_id=user_id, black_id=uuid4())
+    game.status = "timeout"
+    game.result = "0-1"
+    game.termination_reason = "disconnect_timeout"
+    manager = RecordingManager()
+    manager.current = False
+    side_effects: list[tuple[str, object]] = []
+
+    async def restore_active_room_membership(_user_id):
+        return game
+
+    class GameService:
+        def __init__(self, _repo) -> None:
+            pass
+
+        async def mark_reconnected(self, reconnected_user_id):
+            assert reconnected_user_id == user_id
+            return game
+
+    class GameRepository:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_moves(self, _game_id):
+            return []
+
+    async def game_state_payload(_game, _moves, _session):
+        return {"status": game.status}
+
+    async def apply_ratings(game_id, _session):
+        side_effects.append(("ratings", game_id))
+        return None
+
+    async def sync_tournament(game_id, _session):
+        side_effects.append(("tournament", game_id))
+
+    monkeypatch.setattr(ws_entry, "manager", manager)
+    monkeypatch.setattr(game_ws, "manager", manager)
+    monkeypatch.setattr(ws_entry, "decode_token", lambda _token: {"type": "access", "sub": str(user_id)})
+    monkeypatch.setattr(ws_entry, "_restore_active_room_membership", restore_active_room_membership)
+    monkeypatch.setattr(ws_entry, "async_session_factory", fake_session_factory)
+    monkeypatch.setattr(ws_entry, "GameService", GameService)
+    monkeypatch.setattr(ws_entry, "SqlAlchemyGameRepository", GameRepository)
+    monkeypatch.setattr(game_ws, "_game_state_payload", game_state_payload)
+    monkeypatch.setattr(game_ws, "_apply_ratings_if_needed", apply_ratings)
+    monkeypatch.setattr(game_ws, "_sync_tournament_if_needed", sync_tournament)
+
+    await ws_entry.ws_endpoint(FakeWebSocket(token="good"))  # type: ignore[arg-type]
+
+    assert side_effects == [("ratings", game.id), ("tournament", game.id)]
+    assert [(event[1], event[2]["reason"]) for event in manager.broadcasts] == [
+        (EventType.GAME_OVER, "disconnect_timeout")
+    ]
 
 
 @pytest.mark.asyncio
@@ -281,6 +366,191 @@ async def test_game_ws_move_validates_game_id_and_broadcasts_state(monkeypatch):
                 "last_move": {"uci": "e2e4", "move_number": 1},
             },
         )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_game_state_payload_exposes_pending_draw_offer_fields(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    game = Game(white_id=white_id, black_id=black_id)
+    offered_at = datetime(2026, 6, 10, 12, 30, tzinfo=timezone.utc)
+    game.pending_draw_offer_by_user_id = white_id
+    game.pending_draw_offer_at = offered_at
+
+    class UserRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_by_id(self, requested_user_id):
+            return SimpleNamespace(id=requested_user_id, username=str(requested_user_id), rating=1510)
+
+    monkeypatch.setattr(game_ws, "SqlAlchemyUserRepository", UserRepo)
+
+    payload = await game_ws._game_state_payload(game, [], object())
+
+    assert payload["pending_draw_offer_by_user_id"] == str(white_id)
+    assert payload["pending_draw_offer_at"] == offered_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_game_ws_draw_offer_uses_participant_opponent_and_broadcasts_fresh_state(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    game = Game(white_id=white_id, black_id=black_id)
+    offered_at = datetime(2026, 6, 10, 12, 35, tzinfo=timezone.utc)
+    game.pending_draw_offer_by_user_id = white_id
+    game.pending_draw_offer_at = offered_at
+    manager = RecordingManager()
+    manager.opponent_id = str(uuid4())
+
+    class Service:
+        async def offer_draw(self, command):
+            assert command.game_id == game.id
+            assert command.user_id == white_id
+            return game
+
+    class GameRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_moves(self, requested_game_id):
+            assert requested_game_id == game.id
+            return []
+
+    async def game_state_payload(requested_game, moves, _session):
+        assert requested_game is game
+        assert moves == []
+        return {
+            "status": "active",
+            "last_move": None,
+            "pending_draw_offer_by_user_id": str(white_id),
+            "pending_draw_offer_at": offered_at.isoformat(),
+        }
+
+    monkeypatch.setattr(game_ws, "manager", manager)
+    monkeypatch.setattr(game_ws, "_build_service", lambda _session: Service())
+    monkeypatch.setattr(game_ws, "SqlAlchemyGameRepository", GameRepo)
+    monkeypatch.setattr(game_ws, "_game_state_payload", game_state_payload)
+
+    await game_ws.handle_draw_offer(
+        WSEnvelope(type=EventType.DRAW_OFFER, game_id=str(game.id), payload={}),
+        str(white_id),
+        object(),
+    )
+
+    assert manager.sent == [
+        (
+            str(black_id),
+            EventType.DRAW_OFFERED,
+            {"from_user_id": str(white_id)},
+            str(game.id),
+        )
+    ]
+    assert manager.broadcasts == [
+        (
+            str(game.id),
+            EventType.GAME_STATE,
+            {
+                "status": "active",
+                "last_move": None,
+                "pending_draw_offer_by_user_id": str(white_id),
+                "pending_draw_offer_at": offered_at.isoformat(),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_game_ws_draw_decline_uses_service_offerer_and_broadcasts_cleared_state(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    game = Game(white_id=white_id, black_id=black_id)
+    game.pending_draw_offer_by_user_id = None
+    game.pending_draw_offer_at = None
+    manager = RecordingManager()
+    manager.opponent_id = str(uuid4())
+
+    class Service:
+        async def decline_draw(self, command):
+            assert command.game_id == game.id
+            assert command.user_id == black_id
+            return game, white_id
+
+    class GameRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_moves(self, requested_game_id):
+            assert requested_game_id == game.id
+            return []
+
+    async def game_state_payload(requested_game, moves, _session):
+        assert requested_game is game
+        assert moves == []
+        return {
+            "status": "active",
+            "last_move": None,
+            "pending_draw_offer_by_user_id": None,
+            "pending_draw_offer_at": None,
+        }
+
+    monkeypatch.setattr(game_ws, "manager", manager)
+    monkeypatch.setattr(game_ws, "_build_service", lambda _session: Service())
+    monkeypatch.setattr(game_ws, "SqlAlchemyGameRepository", GameRepo)
+    monkeypatch.setattr(game_ws, "_game_state_payload", game_state_payload)
+
+    await game_ws.handle_draw_decline(
+        WSEnvelope(type=EventType.DRAW_DECLINE, game_id=str(game.id), payload={}),
+        str(black_id),
+        object(),
+    )
+
+    assert manager.sent == [
+        (str(white_id), EventType.DRAW_DECLINED, {}, str(game.id))
+    ]
+    assert manager.broadcasts == [
+        (
+            str(game.id),
+            EventType.GAME_STATE,
+            {
+                "status": "active",
+                "last_move": None,
+                "pending_draw_offer_by_user_id": None,
+                "pending_draw_offer_at": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_game_ws_draw_accept_maps_missing_offer_error(monkeypatch):
+    from domains.game.domain import exceptions as game_exceptions
+
+    draw_not_found = getattr(
+        game_exceptions,
+        "DrawOfferNotFound",
+        type("DrawOfferNotFound", (Exception,), {}),
+    )
+    user_id = uuid4()
+    game_id = uuid4()
+    manager = RecordingManager()
+
+    class Service:
+        async def accept_draw(self, _command):
+            raise draw_not_found()
+
+    monkeypatch.setattr(game_ws, "manager", manager)
+    monkeypatch.setattr(game_ws, "_build_service", lambda _session: Service())
+
+    await game_ws.handle_draw_accept(
+        WSEnvelope(type=EventType.DRAW_ACCEPT, game_id=str(game_id), payload={}),
+        str(user_id),
+        object(),
+    )
+
+    assert manager.errors == [
+        (str(user_id), "DRAW_OFFER_NOT_FOUND", "No draw offer is pending")
     ]
 
 

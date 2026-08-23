@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from domains.game.domain.policies import DEFAULT_GAME_START_FEN, DEFAULT_INITIAL_RATING
+from domains.game.domain.policies import DEFAULT_DISCONNECT_GRACE_MS, DEFAULT_GAME_START_FEN, DEFAULT_INITIAL_RATING
 from domains.game.domain.value_objects import GameResult, GameStatus, StartingRatings
 from shared.time_controls import DEFAULT_TIME_CONTROL, TimeControl
 
@@ -32,6 +32,10 @@ class Game:
     last_clock_started_at: datetime | None = None
     disconnected_player_id: UUID | None = None
     disconnect_grace_deadline_at: datetime | None = None
+    pending_draw_offer_by_user_id: UUID | None = None
+    pending_draw_offer_at: datetime | None = None
+    white_disconnect_grace_remaining_ms: int = DEFAULT_DISCONNECT_GRACE_MS
+    black_disconnect_grace_remaining_ms: int = DEFAULT_DISCONNECT_GRACE_MS
     rated: bool = True
     white_rating_before: int = DEFAULT_INITIAL_RATING
     black_rating_before: int = DEFAULT_INITIAL_RATING

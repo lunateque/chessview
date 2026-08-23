@@ -26,3 +26,23 @@ class GameNotFound(Exception):
 class GameAccessDenied(Exception):
     """Raised when a user is not allowed to act on a game."""
     pass
+
+
+class DrawOfferPending(Exception):
+    """Raised when a counter-offer arrives while a draw offer is pending."""
+    pass
+
+
+class DrawOfferNotFound(Exception):
+    """Raised when resolving a game without a pending draw offer."""
+    pass
+
+
+class DrawOfferNotAcceptable(Exception):
+    """Raised when the offerer tries to resolve their own draw offer."""
+    pass
+
+
+class ConcurrentMoveConflict(Exception):
+    """Raised when another move commits the same move number first."""
+    pass

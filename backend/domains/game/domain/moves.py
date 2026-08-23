@@ -10,7 +10,7 @@ from domains.game.domain.clock import capture_clock_snapshot
 from domains.game.domain.entities import Game, Move
 from domains.game.domain.exceptions import IllegalMove, NotYourTurn
 from domains.game.domain.policies import DEFAULT_GAME_START_FEN
-from domains.game.domain.outcomes import apply_board_outcome, clear_disconnect_state
+from domains.game.domain.outcomes import apply_board_outcome, clear_disconnect_state, clear_draw_offer
 
 
 def apply_player_move(
@@ -46,6 +46,7 @@ def apply_player_move(
     board.push(parsed_move)
     game.fen = board.fen()
     clear_disconnect_state(game)
+    clear_draw_offer(game)
     apply_board_outcome(game, board, now)
 
     return Move(

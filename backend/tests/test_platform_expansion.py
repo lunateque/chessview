@@ -753,6 +753,9 @@ async def test_identity_verification_failure_forfeits_active_game_for_opponent()
             assert game_id == game.id
             return game
 
+        async def get_by_id_for_update(self, game_id):
+            return await self.get_by_id(game_id)
+
         async def update(self, updated_game):
             self.updated = updated_game
             return updated_game
@@ -802,6 +805,12 @@ async def test_identity_verification_failure_cannot_forfeit_when_user_is_not_pla
             assert game_id == game.id
             return game
 
+        async def get_by_id_for_update(self, game_id):
+            return await self.get_by_id(game_id)
+
+        async def rollback(self):
+            return None
+
         async def update(self, _updated_game):
             raise AssertionError("non-player identity failure must not update the game")
 
@@ -836,6 +845,12 @@ async def test_nonparticipant_cannot_resign_or_accept_draw_for_game():
         async def get_by_id(self, game_id):
             assert game_id == game.id
             return game
+
+        async def get_by_id_for_update(self, game_id):
+            return await self.get_by_id(game_id)
+
+        async def rollback(self):
+            return None
 
         async def update(self, _updated_game):
             raise AssertionError("non-player action must not update the game")

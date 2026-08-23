@@ -11,7 +11,17 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from domains.communication.domain.exceptions import MessageTooLong
-from domains.game.domain.exceptions import GameAccessDenied, GameNotActive, GameNotFound, IllegalMove, NotYourTurn
+from domains.game.domain.exceptions import (
+    ConcurrentMoveConflict,
+    DrawOfferNotAcceptable,
+    DrawOfferNotFound,
+    DrawOfferPending,
+    GameAccessDenied,
+    GameNotActive,
+    GameNotFound,
+    IllegalMove,
+    NotYourTurn,
+)
 from domains.identity.domain.exceptions import (
     DuplicateEmail,
     DuplicateUsername,
@@ -45,6 +55,10 @@ EXCEPTION_MAPPINGS: tuple[ExceptionMapping, ...] = (
     ((NotYourTurn,), status.HTTP_409_CONFLICT, "NOT_YOUR_TURN", "It is not your turn"),
     ((GameNotActive,), status.HTTP_409_CONFLICT, "GAME_NOT_ACTIVE", "The game is no longer active"),
     ((GameAccessDenied,), status.HTTP_403_FORBIDDEN, "GAME_ACCESS_DENIED", "You cannot act on this game"),
+    ((DrawOfferPending,), status.HTTP_409_CONFLICT, "DRAW_OFFER_PENDING", "A draw offer is already pending"),
+    ((DrawOfferNotFound,), status.HTTP_409_CONFLICT, "DRAW_OFFER_NOT_FOUND", "No draw offer is pending"),
+    ((DrawOfferNotAcceptable,), status.HTTP_409_CONFLICT, "DRAW_OFFER_NOT_ACCEPTABLE", "Only the opponent can accept or decline this draw offer"),
+    ((ConcurrentMoveConflict,), status.HTTP_409_CONFLICT, "MOVE_CONFLICT", "Another move was committed first"),
     ((AlreadyInQueue,), status.HTTP_409_CONFLICT, "ALREADY_IN_QUEUE", "You are already in the queue"),
     ((NotInQueue,), status.HTTP_409_CONFLICT, "NOT_IN_QUEUE", "You are not currently in the queue"),
     ((MessageTooLong,), status.HTTP_400_BAD_REQUEST, "MESSAGE_TOO_LONG", "Chat messages cannot exceed 500 characters"),

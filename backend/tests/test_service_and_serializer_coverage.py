@@ -239,6 +239,16 @@ async def test_identity_service_register_login_refresh_oauth_and_profile_updates
         "token_type": "bearer",
     }
 
+    repo.users[user_id].banned_at = datetime.now(timezone.utc)
+    with pytest.raises(InvalidCredentials):
+        await service.refresh(RefreshTokenCommand(refresh_token=f"refresh:{user_id}"))
+    repo.users[user_id].banned_at = None
+
+    removed_user = repo.users.pop(user_id)
+    with pytest.raises(InvalidCredentials):
+        await service.refresh(RefreshTokenCommand(refresh_token=f"refresh:{user_id}"))
+    repo.users[user_id] = removed_user
+
     service._decode_token = lambda _token: {"type": "access", "sub": str(user_id)}
     with pytest.raises(InvalidCredentials):
         await service.refresh(RefreshTokenCommand(refresh_token="not-refresh"))
@@ -426,19 +436,39 @@ async def test_security_tokens_and_current_user_dependency(monkeypatch):
     assert decode_token(refresh)["type"] == "refresh"
 
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=access)
-    assert await get_current_user_id(credentials) == user_id
+
+    class FakeSession:
+        def __init__(self, user):
+            self.user = user
+
+        async def get(self, model, key):
+            assert model is UserModel
+            assert key == UUID(user_id)
+            return self.user
+
+    active_user = SimpleNamespace(banned_at=None)
+    assert await get_current_user_id(credentials, FakeSession(active_user)) == user_id
+
+    banned_user = SimpleNamespace(banned_at=datetime.now(timezone.utc))
+    with pytest.raises(HTTPException) as exc_info:
+        await get_current_user_id(credentials, FakeSession(banned_user))
+    assert exc_info.value.status_code == 401
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_current_user_id(credentials, FakeSession(None))
+    assert exc_info.value.status_code == 401
 
     monkeypatch.setattr("app.dependencies.decode_token", lambda _token: {"type": "refresh", "sub": user_id})
     with pytest.raises(HTTPException):
-        await get_current_user_id(credentials)
+        await get_current_user_id(credentials, FakeSession(active_user))
 
     monkeypatch.setattr("app.dependencies.decode_token", lambda _token: {"type": "access"})
     with pytest.raises(HTTPException):
-        await get_current_user_id(credentials)
+        await get_current_user_id(credentials, FakeSession(active_user))
 
     monkeypatch.setattr("app.dependencies.decode_token", lambda _token: (_ for _ in ()).throw(RuntimeError()))
     with pytest.raises(HTTPException):
-        await get_current_user_id(credentials)
+        await get_current_user_id(credentials, FakeSession(active_user))
 
 
 def test_game_clock_moves_and_lifecycle_edges():
@@ -488,7 +518,7 @@ def test_game_clock_moves_and_lifecycle_edges():
         last_updated_at=now,
     )
 
-    pause_for_disconnect(game, black_id, snapshot, now, 15)
+    pause_for_disconnect(game, black_id, snapshot, now, 15_000)
     assert game.disconnected_player_id == black_id
     assert active_remaining_time_ms(game, now) == 1
 
@@ -507,7 +537,9 @@ def test_game_clock_moves_and_lifecycle_edges():
     assert game.result == GameResult.BLACK_WINS
 
     game.status = GameStatus.ACTIVE
-    accept_draw(game, snapshot, now)
+    game.pending_draw_offer_by_user_id = white_id
+    game.pending_draw_offer_at = now
+    accept_draw(game, black_id, snapshot, now)
     assert game.status == GameStatus.DRAW
     assert game.result == GameResult.DRAW
 
@@ -950,7 +982,7 @@ class GenericMemorySession:
 
 
 @pytest.mark.asyncio
-async def test_payment_service_creates_simulates_confirms_and_refunds():
+async def test_payment_service_creates_simulates_and_confirms_payments():
     session = GenericMemorySession()
     service = PaymentService(session)
     user_id = uuid4()
@@ -1002,10 +1034,6 @@ async def test_payment_service_creates_simulates_confirms_and_refunds():
     response = PaymentService.to_response(succeeded)
     assert response.subject_type == "tournament"
 
-    refunded = await service.simulate(payment.id, "refunded")
-    assert refunded.status == "refunded"
-    assert user.coins == 1000
-    assert session.store[(TournamentPlayerModel, (tournament_id, user_id))].status == "withdrawn"
 
     scheduled_payment = await service.create_scheduled_match_payment(match_id, user_id)
     assert PaymentService.to_response(scheduled_payment).subject_type == "scheduled_match"
@@ -1014,6 +1042,34 @@ async def test_payment_service_creates_simulates_confirms_and_refunds():
 
     with pytest.raises(HTTPException):
         await service.create_scheduled_match_payment(match_id, uuid4())
+
+
+@pytest.mark.asyncio
+async def test_payment_service_rejects_replay_after_terminal_status():
+    session = GenericMemorySession()
+    service = PaymentService(session)
+    payment_id = uuid4()
+    user_id = uuid4()
+    tournament_id = uuid4()
+    payment = PaymentIntentModel(
+        id=payment_id,
+        user_id=user_id,
+        tournament_id=tournament_id,
+        scheduled_match_id=None,
+        amount_cents=250,
+        currency="CVC",
+        status="refunded",
+        scenario="refunded",
+        reserved_until=None,
+        metadata_json={"wallet_debited": True, "wallet_refunded": True, "wallet_amount": 250},
+        created_at=datetime.now(timezone.utc),
+    )
+    session.store[(PaymentIntentModel, payment_id)] = payment
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.simulate(payment_id, "success")
+
+    assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio

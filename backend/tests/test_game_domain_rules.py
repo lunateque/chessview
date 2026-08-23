@@ -4,8 +4,9 @@ from uuid import uuid4
 import chess
 import pytest
 
-from domains.game.application.commands import MakeMoveCommand
+from domains.game.application.commands import AcceptDrawCommand, MakeMoveCommand
 from domains.game.application.services import GameService
+from domains.game.domain.exceptions import DrawOfferNotAcceptable
 from domains.game.domain.clock import capture_clock_snapshot
 from domains.game.domain.entities import Game, Move
 from domains.game.domain.outcomes import pause_for_disconnect
@@ -26,11 +27,17 @@ class InMemoryGameRepository:
     async def get_by_id(self, game_id):
         return self.games.get(game_id)
 
+    async def get_by_id_for_update(self, game_id):
+        return await self.get_by_id(game_id)
+
     async def get_active_by_user(self, user_id):
         for game in self.games.values():
             if game.status == GameStatus.ACTIVE and user_id in (game.white_id, game.black_id):
                 return game
         return None
+
+    async def get_active_by_user_for_update(self, user_id):
+        return await self.get_active_by_user(user_id)
 
     async def list_active(self):
         return [game for game in self.games.values() if game.status == GameStatus.ACTIVE]
@@ -95,7 +102,7 @@ def test_pause_for_disconnect_freezes_clock_and_marks_grace_deadline():
     )
     snapshot = capture_clock_snapshot(game, now)
 
-    pause_for_disconnect(game, user_id, snapshot, now, 20)
+    pause_for_disconnect(game, user_id, snapshot, now, 20_000)
 
     assert game.last_clock_started_at is None
     assert game.disconnected_player_id == user_id
@@ -199,3 +206,86 @@ async def test_replay_divergence_falls_back_to_authoritative_fen(monkeypatch):
     assert move.uci == "e7e5"
     assert finished_game.status == GameStatus.ACTIVE
     assert finished_game.fen == board.fen()
+
+
+@pytest.mark.asyncio
+async def test_accept_draw_rejects_offerer_accepting_own_pending_offer(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    now = datetime(2026, 4, 14, 12, 5, tzinfo=timezone.utc)
+    repo = InMemoryGameRepository()
+    service = GameService(repo)
+    game = Game(
+        white_id=white_id,
+        black_id=black_id,
+        last_clock_started_at=now,
+        started_at=now,
+    )
+    game.pending_draw_offer_by_user_id = white_id
+    game.pending_draw_offer_at = now
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: now)
+    with pytest.raises(DrawOfferNotAcceptable):
+        await service.accept_draw(AcceptDrawCommand(game_id=game.id, user_id=white_id))
+
+    assert game.status == GameStatus.ACTIVE
+    assert game.result is None
+    assert game.pending_draw_offer_by_user_id == white_id
+
+
+@pytest.mark.asyncio
+async def test_accept_draw_by_opponent_finishes_game_and_clears_pending_offer(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    offered_at = datetime(2026, 4, 14, 12, 10, tzinfo=timezone.utc)
+    accepted_at = offered_at + timedelta(seconds=3)
+    repo = InMemoryGameRepository()
+    service = GameService(repo)
+    game = Game(
+        white_id=white_id,
+        black_id=black_id,
+        last_clock_started_at=offered_at,
+        started_at=offered_at,
+    )
+    game.pending_draw_offer_by_user_id = white_id
+    game.pending_draw_offer_at = offered_at
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: accepted_at)
+    finished_game = await service.accept_draw(AcceptDrawCommand(game_id=game.id, user_id=black_id))
+
+    assert finished_game.status == GameStatus.DRAW
+    assert finished_game.result == GameResult.DRAW
+    assert finished_game.termination_reason == "draw_agreement"
+    assert finished_game.pending_draw_offer_by_user_id is None
+    assert finished_game.pending_draw_offer_at is None
+
+
+@pytest.mark.asyncio
+async def test_legal_move_clears_pending_draw_offer(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    offered_at = datetime(2026, 4, 14, 12, 15, tzinfo=timezone.utc)
+    move_at = offered_at + timedelta(seconds=2)
+    repo = InMemoryGameRepository()
+    service = GameService(repo)
+    game = Game(
+        white_id=white_id,
+        black_id=black_id,
+        last_clock_started_at=offered_at,
+        started_at=offered_at,
+    )
+    game.pending_draw_offer_by_user_id = black_id
+    game.pending_draw_offer_at = offered_at
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: move_at)
+    updated_game, move = await service.make_move(
+        MakeMoveCommand(game_id=game.id, user_id=white_id, uci="e2e4")
+    )
+
+    assert move is not None
+    assert updated_game.status == GameStatus.ACTIVE
+    assert updated_game.pending_draw_offer_by_user_id is None
+    assert updated_game.pending_draw_offer_at is None

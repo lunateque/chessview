@@ -15,9 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.events import EventType, WSEnvelope
 from shared.ws_manager import manager
-from domains.game.application.commands import AcceptDrawCommand, MakeMoveCommand, ResignCommand
+from domains.game.application.commands import AcceptDrawCommand, DeclineDrawCommand, MakeMoveCommand, OfferDrawCommand, ResignCommand
 from domains.game.application.services import GameService, current_clock_snapshot
 from domains.game.domain.exceptions import GameNotActive, GameNotFound, IllegalMove, NotYourTurn
+from shared.exception_handlers import map_exception_to_ws_error
 from domains.game.infrastructure.repository import SqlAlchemyGameRepository
 from domains.identity.infrastructure.repository import SqlAlchemyUserRepository
 from domains.ratings.application.services import RatingService
@@ -57,6 +58,10 @@ async def _game_state_payload(game, moves_list: list[str], session: AsyncSession
         "termination_reason": game.termination_reason,
         "clock": current_clock_snapshot(game),
         "move_history": moves_list,
+        "pending_draw_offer_by_user_id": (
+            str(game.pending_draw_offer_by_user_id) if game.pending_draw_offer_by_user_id is not None else None
+        ),
+        "pending_draw_offer_at": game.pending_draw_offer_at.isoformat() if game.pending_draw_offer_at is not None else None,
     }
 
 
@@ -109,6 +114,38 @@ def _game_over_payload(game, rating_update, reason: str) -> dict:
     return payload
 
 
+async def _broadcast_game_over(game, session: AsyncSession, reason: str | None = None) -> None:
+    rating_update = await _apply_ratings_if_needed(game.id, session)
+    await _sync_tournament_if_needed(game.id, session)
+    await manager.broadcast_to_room(
+        str(game.id),
+        EventType.GAME_OVER,
+        _game_over_payload(game, rating_update, reason or game.termination_reason or game.status),
+    )
+
+
+
+async def _send_mapped_error(user_id: str, exc: Exception) -> bool:
+    mapped_error = map_exception_to_ws_error(exc)
+    if mapped_error is None:
+        return False
+    code, message = mapped_error
+    await manager.send_error(user_id, code, message)
+    return True
+
+
+def _opponent_id(game, user_id: UUID) -> UUID:
+    return game.black_id if user_id == game.white_id else game.white_id
+
+
+async def _broadcast_game_state(game, session: AsyncSession) -> None:
+    moves = await SqlAlchemyGameRepository(session).get_moves(game.id)
+    payload = await _game_state_payload(game, [move.uci for move in moves], session)
+    payload["last_move"] = (
+        {"uci": moves[-1].uci, "move_number": moves[-1].move_number} if moves else None
+    )
+    await manager.broadcast_to_room(str(game.id), EventType.GAME_STATE, payload)
+
 async def handle_move(envelope: WSEnvelope, user_id: str, session: AsyncSession) -> None:
     """Handle a 'move' event: validate via GameService, broadcast game_state."""
     game_id = envelope.game_id
@@ -138,14 +175,14 @@ async def handle_move(envelope: WSEnvelope, user_id: str, session: AsyncSession)
     except IllegalMove:
         await manager.send_error(user_id, "ILLEGAL_MOVE", f"Illegal move: {uci}")
         return
+    except Exception as exc:
+        if await _send_mapped_error(user_id, exc):
+            return
+        raise
 
     # Build move history list
     all_moves = await SqlAlchemyGameRepository(session).get_moves(UUID(game_id))
     move_history = [m.uci for m in all_moves]
-    rating_update = None
-    if game.status != "active":
-        rating_update = await _apply_ratings_if_needed(UUID(game_id), session)
-        await _sync_tournament_if_needed(UUID(game_id), session)
 
     payload = await _game_state_payload(game, move_history, session)
     payload["last_move"] = {"uci": move_entity.uci, "move_number": move_entity.move_number} if move_entity else None
@@ -155,11 +192,7 @@ async def handle_move(envelope: WSEnvelope, user_id: str, session: AsyncSession)
 
     # If game ended, also send game_over
     if game.status != "active":
-        await manager.broadcast_to_room(
-            game_id,
-            EventType.GAME_OVER,
-            _game_over_payload(game, rating_update, game.termination_reason or game.status),
-        )
+        await _broadcast_game_over(game, session)
 
 
 async def handle_resign(envelope: WSEnvelope, user_id: str, session: AsyncSession) -> None:
@@ -179,25 +212,31 @@ async def handle_resign(envelope: WSEnvelope, user_id: str, session: AsyncSessio
         await manager.send_error(user_id, "GAME_NOT_ACTIVE", "Game is not active")
         return
 
-    rating_update = await _apply_ratings_if_needed(UUID(game_id), session)
-    await _sync_tournament_if_needed(UUID(game_id), session)
-    await manager.broadcast_to_room(
-        game_id,
-        EventType.GAME_OVER,
-        _game_over_payload(game, rating_update, "resignation"),
-    )
+    await _broadcast_game_over(game, session, game.termination_reason or "resignation")
 
 
 async def handle_draw_offer(envelope: WSEnvelope, user_id: str, session: AsyncSession) -> None:
-    """Handle a 'draw_offer' event: forward to opponent."""
+    """Handle a 'draw_offer' event: record the offer and notify the opponent."""
     game_id = envelope.game_id
     if not game_id:
         await manager.send_error(user_id, "NOT_IN_GAME", "game_id required")
         return
-    opponent_id = await manager.get_opponent_id(game_id, user_id)
-    if opponent_id:
-        await manager.send_to_user(opponent_id, EventType.DRAW_OFFERED, {"from_user_id": user_id}, game_id=game_id)
 
+    service = _build_service(session)
+    try:
+        game = await service.offer_draw(OfferDrawCommand(game_id=UUID(game_id), user_id=UUID(user_id)))
+    except Exception as exc:
+        if await _send_mapped_error(user_id, exc):
+            return
+        raise
+
+    if game.status != "active":
+        await _broadcast_game_over(game, session)
+        return
+
+    opponent_id = _opponent_id(game, UUID(user_id))
+    await manager.send_to_user(str(opponent_id), EventType.DRAW_OFFERED, {"from_user_id": user_id}, game_id=game_id)
+    await _broadcast_game_state(game, session)
 
 async def handle_draw_accept(envelope: WSEnvelope, user_id: str, session: AsyncSession) -> None:
     """Handle a 'draw_accept' event: finalize draw, broadcast game_over."""
@@ -211,25 +250,35 @@ async def handle_draw_accept(envelope: WSEnvelope, user_id: str, session: AsyncS
         game = await service.accept_draw(
             AcceptDrawCommand(game_id=UUID(game_id), user_id=UUID(user_id))
         )
-    except GameNotFound:
-        return
-    except GameNotActive:
-        return
+    except Exception as exc:
+        if await _send_mapped_error(user_id, exc):
+            return
+        raise
 
-    rating_update = await _apply_ratings_if_needed(UUID(game_id), session)
-    await _sync_tournament_if_needed(UUID(game_id), session)
-    await manager.broadcast_to_room(
-        game_id,
-        EventType.GAME_OVER,
-        _game_over_payload(game, rating_update, "draw_agreement"),
-    )
+    await _broadcast_game_over(game, session, game.termination_reason or "draw_agreement")
 
 
 async def handle_draw_decline(envelope: WSEnvelope, user_id: str, session: AsyncSession) -> None:
-    """Handle a 'draw_decline' event: notify the offerer."""
+    """Handle a 'draw_decline' event: clear the offer and notify the offerer."""
     game_id = envelope.game_id
     if not game_id:
+        await manager.send_error(user_id, "NOT_IN_GAME", "game_id required")
         return
-    opponent_id = await manager.get_opponent_id(game_id, user_id)
-    if opponent_id:
-        await manager.send_to_user(opponent_id, EventType.DRAW_DECLINED, {}, game_id=game_id)
+
+    service = _build_service(session)
+    try:
+        game, offerer_id = await service.decline_draw(
+            DeclineDrawCommand(game_id=UUID(game_id), user_id=UUID(user_id))
+        )
+    except Exception as exc:
+        if await _send_mapped_error(user_id, exc):
+            return
+        raise
+
+    if game.status != "active":
+        await _broadcast_game_over(game, session)
+        return
+    if offerer_id is None:
+        raise RuntimeError("Active draw decline did not return an offerer")
+    await manager.send_to_user(str(offerer_id), EventType.DRAW_DECLINED, {}, game_id=game_id)
+    await _broadcast_game_state(game, session)

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from domains.game.application.services import GameService
 from domains.game.infrastructure.repository import SqlAlchemyGameRepository
+from domains.identity.infrastructure.models import UserModel
 from infrastructure.database import async_session_factory
 from infrastructure.security import decode_token
 from shared.events import EventType, WSEnvelope
@@ -100,6 +101,18 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=4001)
         return
 
+    try:
+        user_uuid = UUID(user_id)
+    except ValueError:
+        await websocket.close(code=4001)
+        return
+
+    async with async_session_factory() as session:
+        user = await session.get(UserModel, user_uuid)
+    if user is None or user.banned_at is not None:
+        await websocket.close(code=4001)
+        return
+
     await websocket.accept()
     await manager.connect(user_id, websocket)
     active_game = await _restore_active_room_membership(user_id)
@@ -108,14 +121,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             service = GameService(SqlAlchemyGameRepository(session))
             resumed_game = await service.mark_reconnected(UUID(user_id))
             if resumed_game is not None:
-                from domains.game.presentation.ws_handler import _game_state_payload
+                from domains.game.presentation.ws_handler import _broadcast_game_over, _broadcast_game_state
 
-                moves = await SqlAlchemyGameRepository(session).get_moves(resumed_game.id)
-                payload = await _game_state_payload(resumed_game, [move.uci for move in moves], session)
-                payload["last_move"] = (
-                    {"uci": moves[-1].uci, "move_number": moves[-1].move_number} if moves else None
-                )
-                await manager.broadcast_to_room(str(resumed_game.id), EventType.GAME_STATE, payload)
+                if resumed_game.status == "active":
+                    await _broadcast_game_state(resumed_game, session)
+                else:
+                    await _broadcast_game_over(resumed_game, session)
     logger.info("WS connected: user_id=%s", user_id)
 
     try:
@@ -167,11 +178,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         await manager.disconnect(user_id, websocket)
         if disconnected_game is not None:
             async with async_session_factory() as session:
-                from domains.game.presentation.ws_handler import _game_state_payload
+                from domains.game.presentation.ws_handler import _broadcast_game_over, _broadcast_game_state
 
-                moves = await SqlAlchemyGameRepository(session).get_moves(disconnected_game.id)
-                payload = await _game_state_payload(disconnected_game, [move.uci for move in moves], session)
-                payload["last_move"] = (
-                    {"uci": moves[-1].uci, "move_number": moves[-1].move_number} if moves else None
-                )
-                await manager.broadcast_to_room(str(disconnected_game.id), EventType.GAME_STATE, payload)
+                if disconnected_game.status == "active":
+                    await _broadcast_game_state(disconnected_game, session)
+                else:
+                    await _broadcast_game_over(disconnected_game, session)

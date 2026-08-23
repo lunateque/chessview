@@ -6,8 +6,10 @@ from uuid import UUID
 from domains.game.application.commands import (
     AcceptDrawCommand,
     CreateGameCommand,
+    DeclineDrawCommand,
     IdentityVerificationFailureCommand,
     MakeMoveCommand,
+    OfferDrawCommand,
     ResignCommand,
 )
 from domains.game.domain.entities import Game, Move
@@ -17,10 +19,13 @@ from domains.game.domain.moves import apply_player_move
 from domains.game.domain.outcomes import (
     abort_game,
     accept_draw,
+    decline_draw,
     forfeit_game_for_identity_failure,
+    offer_draw,
     pause_for_disconnect,
     resign_game,
     resume_after_reconnect,
+    set_disconnect_grace_remaining_ms,
     timeout_game,
 )
 from domains.game.domain.policies import DEFAULT_DISCONNECT_GRACE_SECONDS, is_meaningfully_started
@@ -57,25 +62,28 @@ class GameService:
 
     async def make_move(self, cmd: MakeMoveCommand) -> tuple[Game, Move | None]:
         """Validate and apply a chess move, or end the game on time if the clock has expired."""
-        game = await self._require_active_game(cmd.game_id)
-        now = utc_now()
-        expired_game = await self._expire_on_clock_if_needed(game, now)
-        if expired_game is not None:
-            return expired_game, None
-
-        existing_moves = await self._repo.get_moves(cmd.game_id)
-        move_entity = apply_player_move(
-            game,
-            user_id=cmd.user_id,
-            uci=cmd.uci,
-            move_number=len(existing_moves) + 1,
-            now=now,
-            previous_moves=existing_moves,
-        )
         try:
+            game = await self._require_active_game_for_update(cmd.game_id)
+            self._require_participant(game, cmd.user_id)
+            now = utc_now()
+            disconnect_game = await self._finalize_expired_disconnect_if_needed(game, now)
+            if disconnect_game is not None:
+                return disconnect_game, None
+            expired_game = await self._expire_on_clock_if_needed(game, now)
+            if expired_game is not None:
+                return expired_game, None
+
+            existing_moves = await self._repo.get_moves(cmd.game_id)
+            move_entity = apply_player_move(
+                game,
+                user_id=cmd.user_id,
+                uci=cmd.uci,
+                move_number=len(existing_moves) + 1,
+                now=now,
+                previous_moves=existing_moves,
+            )
             move_entity = await self._repo.add_move(move_entity)
-            game = await self._repo.update(game)
-            await self._repo.commit()
+            game = await self._persist_and_commit(game)
         except Exception:
             await self._repo.rollback()
             raise
@@ -83,30 +91,82 @@ class GameService:
 
     async def resign(self, cmd: ResignCommand) -> Game:
         """Handle a player's resignation."""
-        game = await self._require_active_game(cmd.game_id)
-        self._require_participant(game, cmd.user_id)
-        now = utc_now()
-        snapshot = capture_clock_snapshot(game, now)
-        resign_game(game, cmd.user_id, snapshot, now)
-        return await self._update_and_commit(game)
+        try:
+            game = await self._require_active_game_for_update(cmd.game_id)
+            self._require_participant(game, cmd.user_id)
+            now = utc_now()
+            disconnect_game = await self._finalize_expired_disconnect_if_needed(game, now)
+            if disconnect_game is not None:
+                return disconnect_game
+            snapshot = capture_clock_snapshot(game, now)
+            resign_game(game, cmd.user_id, snapshot, now)
+            return await self._persist_and_commit(game)
+        except Exception:
+            await self._repo.rollback()
+            raise
 
     async def stop_for_identity_verification_failure(self, cmd: IdentityVerificationFailureCommand) -> Game:
         """Forfeit an active game when a participant fails identity verification."""
-        game = await self._require_active_game(cmd.game_id)
-        self._require_participant(game, cmd.user_id)
-        now = utc_now()
-        snapshot = capture_clock_snapshot(game, now)
-        forfeit_game_for_identity_failure(game, cmd.user_id, snapshot, now)
-        return await self._update_and_commit(game)
+        try:
+            game = await self._require_active_game_for_update(cmd.game_id)
+            self._require_participant(game, cmd.user_id)
+            now = utc_now()
+            disconnect_game = await self._finalize_expired_disconnect_if_needed(game, now)
+            if disconnect_game is not None:
+                return disconnect_game
+            snapshot = capture_clock_snapshot(game, now)
+            forfeit_game_for_identity_failure(game, cmd.user_id, snapshot, now)
+            return await self._persist_and_commit(game)
+        except Exception:
+            await self._repo.rollback()
+            raise
+
+    async def offer_draw(self, cmd: OfferDrawCommand) -> Game:
+        """Record or refresh a pending draw offer."""
+        try:
+            game = await self._require_active_game_for_update(cmd.game_id)
+            self._require_participant(game, cmd.user_id)
+            now = utc_now()
+            disconnect_game = await self._finalize_expired_disconnect_if_needed(game, now)
+            if disconnect_game is not None:
+                return disconnect_game
+            offer_draw(game, cmd.user_id, now)
+            return await self._persist_and_commit(game)
+        except Exception:
+            await self._repo.rollback()
+            raise
 
     async def accept_draw(self, cmd: AcceptDrawCommand) -> Game:
         """Finalize a draw agreement for an active game."""
-        game = await self._require_active_game(cmd.game_id)
-        self._require_participant(game, cmd.user_id)
-        now = utc_now()
-        snapshot = capture_clock_snapshot(game, now)
-        accept_draw(game, snapshot, now)
-        return await self._update_and_commit(game)
+        try:
+            game = await self._require_active_game_for_update(cmd.game_id)
+            self._require_participant(game, cmd.user_id)
+            now = utc_now()
+            disconnect_game = await self._finalize_expired_disconnect_if_needed(game, now)
+            if disconnect_game is not None:
+                return disconnect_game
+            snapshot = capture_clock_snapshot(game, now)
+            accept_draw(game, cmd.user_id, snapshot, now)
+            return await self._persist_and_commit(game)
+        except Exception:
+            await self._repo.rollback()
+            raise
+
+    async def decline_draw(self, cmd: DeclineDrawCommand) -> tuple[Game, UUID | None]:
+        """Clear a pending draw offer and return the original offerer."""
+        try:
+            game = await self._require_active_game_for_update(cmd.game_id)
+            self._require_participant(game, cmd.user_id)
+            now = utc_now()
+            disconnect_game = await self._finalize_expired_disconnect_if_needed(game, now)
+            if disconnect_game is not None:
+                return disconnect_game, None
+            offerer_id = decline_draw(game, cmd.user_id)
+            game = await self._persist_and_commit(game)
+            return game, offerer_id
+        except Exception:
+            await self._repo.rollback()
+            raise
 
     async def get_game(self, game_id: UUID) -> Game:
         game = await self._repo.get_by_id(game_id)
@@ -122,44 +182,84 @@ class GameService:
     async def get_user_games(self, user_id: UUID, page: int = 1, size: int = 20) -> tuple[list[Game], int]:
         return await self._repo.list_by_user(user_id, page, size)
 
-    async def mark_disconnected(self, user_id: UUID, grace_seconds: int = DEFAULT_DISCONNECT_GRACE_SECONDS) -> Game | None:
-        game = await self._repo.get_active_by_user(user_id)
-        if game is None:
-            return None
+    async def mark_disconnected(self, user_id: UUID) -> Game | None:
+        try:
+            game = await self._repo.get_active_by_user_for_update(user_id)
+            if game is None:
+                return None
 
-        now = utc_now()
-        snapshot = capture_clock_snapshot(game, now)
-        pause_for_disconnect(game, user_id, snapshot, now, grace_seconds)
-        return await self._update_and_commit(game)
+            now = utc_now()
+            if game.disconnect_grace_deadline_at is not None:
+                if game.disconnect_grace_deadline_at <= now:
+                    return await self._finalize_disconnect_expiration(game, now)
+                await self._repo.rollback()
+                return game
+
+            remaining_ms = self._disconnect_grace_remaining_ms(game, user_id)
+            if remaining_ms <= 0:
+                return await self._finalize_disconnect_expiration_for_player(game, user_id, now)
+
+            snapshot = capture_clock_snapshot(game, now)
+            pause_for_disconnect(game, user_id, snapshot, now, remaining_ms)
+            return await self._persist_and_commit(game)
+        except Exception:
+            await self._repo.rollback()
+            raise
 
     async def mark_reconnected(self, user_id: UUID) -> Game | None:
-        game = await self._repo.get_active_by_user(user_id)
-        if game is None or game.disconnected_player_id != user_id:
-            return game
+        try:
+            game = await self._repo.get_active_by_user_for_update(user_id)
+            if game is None:
+                return None
+            now = utc_now()
+            if game.disconnect_grace_deadline_at is not None and game.disconnect_grace_deadline_at <= now:
+                return await self._finalize_disconnect_expiration(game, now)
+            if game.disconnected_player_id != user_id or game.disconnect_grace_deadline_at is None:
+                await self._repo.rollback()
+                return game
 
-        resume_after_reconnect(game, utc_now())
-        return await self._update_and_commit(game)
+            resume_after_reconnect(game, now)
+            return await self._persist_and_commit(game)
+        except Exception:
+            await self._repo.rollback()
+            raise
 
     async def monitor_active_games(self) -> list[Game]:
         now = utc_now()
         updated_games: list[Game] = []
-        for game in await self._repo.list_active():
-            if game.disconnect_grace_deadline_at is not None and game.disconnect_grace_deadline_at <= now:
-                move_count = len(await self._repo.get_moves(game.id))
-                if is_meaningfully_started(move_count):
-                    loser_id = game.disconnected_player_id or active_player_id(game)
-                    if loser_id is not None:
-                        updated_games.append(await self._finalize_timeout(game, loser_id, now, "disconnect_timeout"))
-                else:
-                    updated_games.append(await self._finalize_abort(game, now, "auto_abort"))
-                continue
+        for candidate in await self._repo.list_active():
+            try:
+                game = await self._repo.get_by_id_for_update(candidate.id)
+                if game is None or game.status != GameStatus.ACTIVE:
+                    await self._repo.rollback()
+                    continue
 
-            if active_remaining_time_ms(game, now) <= 0:
-                loser_id = active_player_id(game)
-                if loser_id is not None:
-                    updated_games.append(await self._finalize_timeout(game, loser_id, now, "clock_timeout"))
-
+                updated_game = await self._monitor_locked_game(game, now)
+                if updated_game is None:
+                    await self._repo.rollback()
+                    continue
+                updated_games.append(updated_game)
+            except Exception:
+                await self._repo.rollback()
+                raise
         return updated_games
+
+    async def _monitor_locked_game(self, game: Game, now: datetime) -> Game | None:
+        if game.disconnect_grace_deadline_at is not None and game.disconnect_grace_deadline_at <= now:
+            return await self._finalize_disconnect_expiration(game, now)
+
+        if active_remaining_time_ms(game, now) <= 0:
+            loser_id = active_player_id(game)
+            if loser_id is not None:
+                return await self._finalize_timeout(game, loser_id, now, "clock_timeout")
+
+        return None
+
+    async def _finalize_expired_disconnect_if_needed(self, game: Game, now: datetime) -> Game | None:
+        if game.disconnect_grace_deadline_at is None or game.disconnect_grace_deadline_at > now:
+            return None
+        return await self._finalize_disconnect_expiration(game, now)
+
 
     async def _expire_on_clock_if_needed(self, game: Game, now: datetime) -> Game | None:
         if active_remaining_time_ms(game, now) > 0:
@@ -170,15 +270,31 @@ class GameService:
             return None
         return await self._finalize_timeout(game, loser_id, now, "clock_timeout")
 
+    async def _finalize_disconnect_expiration(self, game: Game, now: datetime) -> Game:
+        disconnected_player_id = game.disconnected_player_id or active_player_id(game)
+        return await self._finalize_disconnect_expiration_for_player(game, disconnected_player_id, now)
+
+    async def _finalize_disconnect_expiration_for_player(self, game: Game, disconnected_player_id: UUID | None, now: datetime) -> Game:
+        if disconnected_player_id is not None:
+            set_disconnect_grace_remaining_ms(game, disconnected_player_id, 0)
+
+        move_count = len(await self._repo.get_moves(game.id))
+        if is_meaningfully_started(move_count):
+            if disconnected_player_id is None:
+                disconnected_player_id = active_player_id(game)
+            if disconnected_player_id is not None:
+                return await self._finalize_timeout(game, disconnected_player_id, now, "disconnect_timeout")
+        return await self._finalize_abort(game, now, "auto_abort")
+
     async def _finalize_timeout(self, game: Game, losing_player_id: UUID, now: datetime, reason: str) -> Game:
         snapshot = capture_clock_snapshot(game, now)
         timeout_game(game, losing_player_id, snapshot, now, reason)
-        return await self._update_and_commit(game)
+        return await self._persist_and_commit(game)
 
     async def _finalize_abort(self, game: Game, now: datetime, reason: str) -> Game:
         snapshot = capture_clock_snapshot(game, now)
         abort_game(game, snapshot, now, reason)
-        return await self._update_and_commit(game)
+        return await self._persist_and_commit(game)
 
     async def _create_and_commit(self, game: Game) -> Game:
         try:
@@ -189,17 +305,14 @@ class GameService:
             raise
         return created
 
-    async def _update_and_commit(self, game: Game) -> Game:
-        try:
-            updated = await self._repo.update(game)
-            await self._repo.commit()
-        except Exception:
-            await self._repo.rollback()
-            raise
+    async def _persist_and_commit(self, game: Game) -> Game:
+        updated = await self._repo.update(game)
+        await self._repo.commit()
         return updated
 
-    async def _require_active_game(self, game_id: UUID) -> Game:
-        game = await self._repo.get_by_id(game_id)
+
+    async def _require_active_game_for_update(self, game_id: UUID) -> Game:
+        game = await self._repo.get_by_id_for_update(game_id)
         if game is None:
             raise GameNotFound()
         if game.status != GameStatus.ACTIVE:
@@ -210,3 +323,11 @@ class GameService:
     def _require_participant(game: Game, user_id: UUID) -> None:
         if user_id not in {game.white_id, game.black_id}:
             raise GameAccessDenied()
+
+    @staticmethod
+    def _disconnect_grace_remaining_ms(game: Game, user_id: UUID) -> int:
+        if user_id == game.white_id:
+            return game.white_disconnect_grace_remaining_ms
+        if user_id == game.black_id:
+            return game.black_disconnect_grace_remaining_ms
+        raise GameAccessDenied()
