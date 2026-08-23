@@ -10,41 +10,41 @@ The line-by-line annotations behind these entries live in [`primitives.code.json
 
 A WebSocket starts as an HTTP upgrade and then stays open so either side can send more messages without opening a new request. A plain HTTP request asks once and gets one response; a chess board needs a WebSocket because moves, clock state, draw offers, chat, and RTC signals can arrive while the user is staring at the board.
 
-**Where:** `backend/app/main.py:141` registers `/ws`, `backend/app/ws_entry.py:86` handles that socket, and `frontend/src/shared/api/ws.ts:105` opens `WS_BASE_URL?token=<token>`.
+**Where:** `backend/app/main.py:101` registers `/ws`, `backend/app/ws_entry.py:87` handles that socket, and `frontend/src/shared/api/ws.ts:105` opens `WS_BASE_URL?token=<token>`.
 
 **What breaks if it is wrong:** 1) White moves. 2) Black's browser has no open channel. 3) Black sees the old board until polling catches up or the page reloads. 4) The clock and legal-turn UI drift from the server.
 
-**Caught by:** `test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors` in `backend/tests/test_ws_workflows.py:95`, and `connects with the bearer token and publishes connection state changes` in `frontend/src/shared/api/__tests__/ws.test.ts:52`.
+**Caught by:** `test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors` in `backend/tests/test_ws_workflows.py:103`, and `connects with the bearer token and publishes connection state changes` in `frontend/src/shared/api/__tests__/ws.test.ts:52`.
 
 ### Typed event envelope
 
 A socket is just bytes unless both sides agree on a shape. ChessView wraps every frame in an envelope with a `type` routing key, a `payload`, an optional `game_id`, and a timestamp.
 
-**Where:** `backend/shared/events.py:14` lists event names and `backend/shared/events.py:41` defines `WSEnvelope`; the server dispatcher looks up handlers from that type at `backend/app/ws_entry.py:131`.
+**Where:** `backend/shared/events.py:14` lists event names and `backend/shared/events.py:41` defines `WSEnvelope`; the server dispatcher looks up handlers from that type at `backend/app/ws_entry.py:142`.
 
 **What breaks if it is wrong:** 1) The client sends `move` but the server expects another key. 2) The dispatcher cannot find the handler. 3) The move is rejected as `INVALID_EVENT` even though the board UI looked valid. 4) If the wrong `game_id` is accepted, an event can leak into the wrong room.
 
-**Caught by:** `test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors` in `backend/tests/test_ws_workflows.py:95` and `sends typed envelopes only when the socket is open` in `frontend/src/shared/api/__tests__/ws.test.ts:65`.
+**Caught by:** `test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors` in `backend/tests/test_ws_workflows.py:103` and `sends typed envelopes only when the socket is open` in `frontend/src/shared/api/__tests__/ws.test.ts:65`.
 
 ### Socket drop state
 
 A socket dropping does not mean the game vanished. The connection manager removes the socket, while the game service freezes the active clock and records which player is inside the reconnect grace window.
 
-**Where:** `backend/app/ws_entry.py:149` catches `WebSocketDisconnect`, `backend/app/ws_entry.py:164` calls `mark_disconnected`, and `backend/domains/game/domain/outcomes.py:80` freezes time and sets the disconnect deadline.
+**Where:** `backend/app/ws_entry.py:160` handles the closed socket, `backend/app/ws_entry.py:175` calls `mark_disconnected`, and `backend/domains/game/domain/outcomes.py:104` freezes time and sets the disconnect deadline from the player's remaining budget.
 
 **What breaks if it is wrong:** 1) A mobile client loses network. 2) The server either keeps charging the clock as if the player were connected, or forgets the player was in a game. 3) Reconnect can resume the wrong state, or the opponent gets a timeout that was never earned.
 
-**Caught by:** `test_pause_for_disconnect_freezes_clock_and_marks_grace_deadline` in `backend/tests/test_game_domain_rules.py:78`, and `test_current_connection_disconnect_cleans_membership` in `backend/tests/test_ws_manager.py:94`.
+**Caught by:** `test_pause_for_disconnect_freezes_clock_and_marks_grace_deadline` in `backend/tests/test_game_domain_rules.py:95`, and `test_current_connection_disconnect_cleans_membership` in `backend/tests/test_ws_manager.py:94`.
 
 ### Server-owned clock
 
 The server, not the browser, decides how much time remains. That is a correctness rule, not a style choice: a client-owned chess clock is a client that can cheat by reporting a larger remaining time after thinking.
 
-**Where:** `backend/domains/game/presentation/ws_handler.py:115` reads only the submitted UCI move, `backend/domains/game/application/services.py:61` takes server time, and `backend/domains/game/domain/clock.py:55` computes the clock snapshot from stored game state.
+**Where:** `backend/domains/game/presentation/ws_handler.py:152` reads only the submitted UCI move, `backend/domains/game/application/services.py:72` takes server time, and `backend/domains/game/domain/clock.py:55` computes the clock snapshot from stored game state.
 
 **What breaks if it is wrong:** 1) A player thinks for 20 seconds. 2) Their browser submits the move with an invented remaining time. 3) The server trusts it. 4) The player never flags, even though the opponent played against a real clock.
 
-**Caught by:** `test_clock_timeout_triggers_when_active_player_flags` in `backend/tests/test_phase2_game_clocks.py:120`; `test_game_ws_move_validates_game_id_and_broadcasts_state` in `backend/tests/test_ws_workflows.py:233` verifies the WS handler passes the move command through, but nothing yet fuzzes extra client-supplied clock fields.
+**Caught by:** `test_clock_timeout_triggers_when_active_player_flags` in `backend/tests/test_phase2_game_clocks.py:441`; `test_game_ws_move_validates_game_id_and_broadcasts_state` in `backend/tests/test_ws_workflows.py:318` verifies the WS handler passes the move command through, but nothing yet fuzzes extra client-supplied clock fields.
 
 ## Redis
 
@@ -94,31 +94,31 @@ A Redis sorted set is a set where each member also has a numeric score. Here the
 
 Wall-clock time is the calendar time humans see, and it can jump if NTP or the host changes it. Monotonic time only moves forward and is the right primitive for measuring elapsed thinking time; this code currently stores UTC wall-clock instants so game state survives process restart, then subtracts those instants to make snapshots.
 
-**Where:** `backend/domains/game/application/services.py:31` defines `utc_now()` with `datetime.now(timezone.utc)`, and `backend/domains/game/domain/clock.py:61` subtracts `last_clock_started_at` from `now` to compute elapsed milliseconds.
+**Where:** `backend/domains/game/application/services.py:40` defines `utc_now()` with `datetime.now(timezone.utc)`, and `backend/domains/game/domain/clock.py:61` subtracts `last_clock_started_at` from `now` to compute elapsed milliseconds.
 
 **What breaks if it is wrong:** 1) The server clock jumps backward during a game. 2) `now - last_clock_started_at` shrinks or goes negative. 3) The active player gains time they did not earn. 4) If it jumps forward, the player can lose on time without thinking that long.
 
-**Caught by:** `test_capture_clock_snapshot_reports_running_white_clock` in `backend/tests/test_game_domain_rules.py:59` covers fixed elapsed-time math; nothing yet simulates wall-clock jumps.
+**Caught by:** `test_capture_clock_snapshot_reports_running_white_clock` in `backend/tests/test_game_domain_rules.py:76` covers fixed elapsed-time math; nothing yet simulates wall-clock jumps.
 
 ### Clock snapshot
 
 A clock snapshot is the server's answer to "if we stop time at this instant, how much time does each player have and is the clock paused?" It turns stored game fields into a payload the frontend can render between server events.
 
-**Where:** `backend/domains/game/domain/clock.py:13` defines `ClockSnapshot`, `backend/domains/game/domain/clock.py:55` captures one, `backend/domains/game/presentation/ws_handler.py:58` includes it in `game_state`, and `frontend/src/shared/hooks/useLiveClock.ts:9` locally counts forward from `last_updated_at` for display.
+**Where:** `backend/domains/game/domain/clock.py:13` defines `ClockSnapshot`, `backend/domains/game/domain/clock.py:55` captures one, `backend/domains/game/presentation/ws_handler.py:59` includes it in `game_state`, and `frontend/src/shared/hooks/useLiveClock.ts:9` locally counts forward from `last_updated_at` for display.
 
 **What breaks if it is wrong:** 1) The server broadcasts `white_time_ms` without `last_updated_at`. 2) The frontend cannot know how much time has passed since the message. 3) The displayed clock freezes or double-counts. 4) A later timeout looks arbitrary to the player.
 
-**Caught by:** `test_capture_clock_snapshot_reports_running_white_clock` in `backend/tests/test_game_domain_rules.py:59`, and `test_game_clock_moves_and_lifecycle_edges` in `backend/tests/test_service_and_serializer_coverage.py:444`.
+**Caught by:** `test_capture_clock_snapshot_reports_running_white_clock` in `backend/tests/test_game_domain_rules.py:76`, and `test_game_clock_moves_and_lifecycle_edges` in `backend/tests/test_service_and_serializer_coverage.py:480`.
 
 ### Disconnect grace period
 
 A grace period is a short server-owned deadline after a disconnect. During it the active chess clock is paused, and when it expires the monitor either aborts an unstarted game or times out a meaningfully started one.
 
-**Where:** `backend/domains/game/domain/policies.py:5` sets the default to 20 seconds, `backend/domains/game/application/services.py:120` marks the disconnect, and `backend/domains/game/application/services.py:142` resolves expired grace windows in the runtime monitor path.
+**Where:** `backend/domains/game/domain/policies.py:5` sets the initial budget to 20 seconds, `backend/domains/game/application/services.py:189` records a disconnect from the player's remaining budget, and `backend/domains/game/application/services.py:253` resolves an expired deadline after locking the current game row.
 
 **What breaks if it is wrong:** 1) A player disconnects before either side has really played. 2) The server treats it like a full rated timeout instead of an abort. 3) Or, after two moves, it aborts a real game instead of awarding the opponent a disconnect timeout. 4) Ratings and tournament standings then describe the wrong result.
 
-**Caught by:** `test_disconnect_grace_auto_aborts_game_before_meaningful_start` in `backend/tests/test_phase2_game_clocks.py:55`, and `test_disconnect_grace_times_out_meaningfully_started_game` in `backend/tests/test_phase2_game_clocks.py:85`.
+**Caught by:** `test_disconnect_grace_auto_aborts_game_before_meaningful_start` in `backend/tests/test_phase2_game_clocks.py:113`, and `test_disconnect_grace_times_out_meaningfully_started_game` in `backend/tests/test_phase2_game_clocks.py:143`.
 
 ## PostgreSQL
 
@@ -126,27 +126,27 @@ A grace period is a short server-owned deadline after a disconnect. During it th
 
 A transaction is the database boundary where related writes become visible together or not at all. A chess move wants the move row and the resulting game row to agree: the move number, `fen_after`, clocks, status, and result are one logical update.
 
-**Where:** `backend/domains/game/application/services.py:66` loads existing moves, `backend/domains/game/application/services.py:76` stages the move row, `backend/domains/game/application/services.py:77` stages the game row, `backend/domains/game/application/services.py:78` commits the shared unit of work, and `backend/domains/game/infrastructure/repository.py:202` flushes without committing inside individual repository methods.
+**Where:** `backend/domains/game/application/services.py:80` loads existing moves after locking the game, `backend/domains/game/application/services.py:89` stages the move row, `backend/domains/game/application/services.py:90` enters the shared persist-and-commit path, and `backend/domains/game/infrastructure/repository.py:240` flushes without committing inside individual repository methods.
 
 **What breaks if it is wrong:** 1) The move row commits. 2) The game update fails before `fen` or clocks are committed. 3) History says `e2e4` happened, but the authoritative game row still shows the old position. 4) Reconnect and REST history can disagree.
 
-**Caught by:** `test_make_move_rolls_back_move_when_game_update_fails` in `backend/tests/test_game_repository_transactions.py:121` asserts that a failure after staging the move leaves both the move list and authoritative game row unchanged.
+**Caught by:** `test_make_move_rolls_back_move_when_game_update_fails` in `backend/tests/test_game_repository_transactions.py:202` asserts that a failure after staging the move leaves both the move list and authoritative game row unchanged.
 
 ### Authoritative board row
 
 The board on screen is a projection. The authoritative position is the `fen` stored on the game, with move rows as history; if replayed move history diverges, the domain code falls back to the stored `fen` rather than trusting a broken replay.
 
-**Where:** `backend/domains/game/infrastructure/models.py:60` stores `GameModel.fen`, `backend/domains/game/infrastructure/models.py:83` stores `MoveModel.fen_after`, and `backend/domains/game/domain/moves.py:60` rebuilds from move history but returns to the stored `game.fen` on divergence.
+**Where:** `backend/domains/game/infrastructure/models.py:64` stores `GameModel.fen`, `backend/domains/game/infrastructure/models.py:91` stores `MoveModel.fen_after`, and `backend/domains/game/domain/moves.py:61` rebuilds from move history but returns to the stored `game.fen` on divergence.
 
 **What breaks if it is wrong:** 1) A process keeps the board only in memory. 2) That process restarts or another process handles the reconnect. 3) The new process has no authoritative board. 4) A player can be shown a legal-move set for the wrong position.
 
-**Caught by:** `test_replay_divergence_falls_back_to_authoritative_fen` in `backend/tests/test_game_domain_rules.py:165`.
+**Caught by:** `test_replay_divergence_falls_back_to_authoritative_fen` in `backend/tests/test_game_domain_rules.py:182`.
 
 ### Games-by-player indexes
 
 An index is a smaller lookup structure PostgreSQL can scan instead of reading the whole table. A query that lists games for one player by `white_id OR black_id` and orders by `started_at` is exactly the kind of query that needs index support as the games table grows.
 
-**Where:** `backend/domains/game/infrastructure/repository.py:61` implements `list_by_user` with `white_id OR black_id`, `backend/domains/game/infrastructure/repository.py:71` orders by newest games, and `backend/alembic/versions/0011_game_player_history_indexes.py:19` creates `ix_games_white_id_started_at_desc` plus `ix_games_black_id_started_at_desc` — one per side of the `OR`, because a single index cannot serve both branches.
+**Where:** `backend/domains/game/infrastructure/repository.py:82` implements `list_by_user` with `white_id OR black_id`, `backend/domains/game/infrastructure/repository.py:61` orders by newest games, and `backend/alembic/versions/0011_game_player_history_indexes.py:19` creates `ix_games_white_id_started_at_desc` plus `ix_games_black_id_started_at_desc` — one per side of the `OR`, because a single index cannot serve both branches.
 
 Measured on PostgreSQL 16 with 60,000 games and 200 users, for a player with 600 of them: with the indexes the planner uses `BitmapOr` over both `Bitmap Index Scan`s and touches 600 rows; with them dropped it falls back to `Seq Scan` and reports `Rows Removed by Filter: 59400`. What the indexes do NOT do is remove the sort — `BitmapOr` does not preserve index order, so the plan still runs a `top-N heapsort`, just over 600 rows instead of 60,000. The `started_at DESC` column is there for the single-side variant of this query, not for this one.
 
@@ -154,17 +154,17 @@ A migration is not the only place the schema is written down; the ORM model is t
 
 **What breaks if it is wrong:** 1) A long-time player opens history. 2) PostgreSQL scans many game rows to find that player. 3) The request gets slower as the site grows. 4) Enough users do it at once and ordinary gameplay endpoints compete for database time.
 
-**Caught by:** `test_games_by_player_indexes_are_declared_in_migrations` in `backend/tests/test_database_bootstrap.py:120` verifies the Alembic upgrade path declares both games-by-player indexes with the filter column before `started_at DESC`.
+**Caught by:** `test_games_by_player_indexes_are_declared_in_migrations` in `backend/tests/test_database_bootstrap.py:235` verifies the Alembic upgrade path declares both games-by-player indexes with the filter column before `started_at DESC`.
 
 ### Alembic migration
 
 A migration is a versioned schema change: create this table, add this column, create this index. Alembic exists so every environment reaches the same schema through recorded steps, rather than by someone editing a database by hand and hoping production matches development.
 
-**Where:** `backend/infrastructure/database_migrations.py:78` runs migrations, `backend/infrastructure/database_migrations.py:109` upgrades to `head`, `backend/alembic/env.py:28` registers models for migration metadata, and `backend/alembic/versions/0001_baseline.py:16` creates the baseline schema.
+**Where:** `backend/infrastructure/database_migrations.py:133` runs migrations, `backend/infrastructure/database_migrations.py:164` upgrades to `head`, `backend/alembic/env.py:28` registers models for migration metadata, and `backend/alembic/versions/0001_baseline.py:16` creates the baseline schema.
 
 **What breaks if it is wrong:** 1) A developer adds a model field but no migration. 2) Their local database happens to have the column. 3) CI or production starts from migrations and does not. 4) The app imports or writes a missing column at runtime.
 
-**Caught by:** `test_initialize_database_runs_migrations_before_seeding` in `backend/tests/test_database_bootstrap.py:12`, `test_to_migration_database_url_rewrites_asyncpg_for_alembic` in `backend/tests/test_database_bootstrap.py:46`, and CI's `uv run alembic check` step in `.github/workflows/pr-ci.yml:91`.
+**Caught by:** `test_initialize_database_runs_migrations_before_seeding` in `backend/tests/test_database_bootstrap.py:25`, `test_to_migration_database_url_rewrites_asyncpg_for_alembic` in `backend/tests/test_database_bootstrap.py:59`, and CI's `uv run alembic check` step in `.github/workflows/pr-ci.yml:91`.
 
 ## HTTP and auth
 
@@ -172,11 +172,11 @@ A migration is a versioned schema change: create this table, add this column, cr
 
 A JWT is a signed claim bundle: here it carries `sub`, expiry, and token type. The server can verify the signature with its secret and recover the user id without storing a session row, but verification is not optional because unsigned or wrongly signed claims are just user-controlled text.
 
-**Where:** `backend/infrastructure/security.py:32` creates access tokens, `backend/infrastructure/security.py:53` decodes and verifies them, `backend/app/dependencies.py:30` protects HTTP routes with a Bearer token, and `backend/app/ws_entry.py:88` requires the token on WebSocket connect.
+**Where:** `backend/infrastructure/security.py:32` creates access tokens, `backend/infrastructure/security.py:53` decodes and verifies them, `backend/app/dependencies.py:30` protects HTTP routes with a Bearer token, and `backend/app/ws_entry.py:89` requires the token on WebSocket connect.
 
 **What breaks if it is wrong:** 1) A client edits a token payload to change `sub`. 2) The server decodes without verifying the signature. 3) The request runs as another user. 4) Game, profile, admin, and WebSocket actions no longer belong to the authenticated player.
 
-**Caught by:** `test_security_tokens_and_current_user_dependency` in `backend/tests/test_service_and_serializer_coverage.py:416`, and `test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors` in `backend/tests/test_ws_workflows.py:95`.
+**Caught by:** `test_security_tokens_and_current_user_dependency` in `backend/tests/test_service_and_serializer_coverage.py:432`, and `test_ws_endpoint_authenticates_dispatches_and_maps_handler_errors` in `backend/tests/test_ws_workflows.py:103`.
 
 ## Testing
 

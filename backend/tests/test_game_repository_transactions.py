@@ -1,10 +1,16 @@
+import asyncio
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import UniqueConstraint
+from sqlalchemy.exc import IntegrityError
 
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/chessview")
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/chessview"
+)
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("STORAGE_DIR", "storage")
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "true")
@@ -17,6 +23,8 @@ os.environ.setdefault("FRONTEND_URL", "http://localhost:5173")
 
 from domains.game.application.commands import MakeMoveCommand
 from domains.game.application.services import GameService
+from domains.game.domain.entities import Game, Move
+from domains.game.domain.exceptions import ConcurrentMoveConflict
 from domains.game.domain.policies import DEFAULT_GAME_START_FEN
 from domains.game.domain.value_objects import GameStatus
 from domains.game.infrastructure.models import GameModel, MoveModel
@@ -113,6 +121,78 @@ class _GameUpdateFailsRepository(SqlAlchemyGameRepository):
         raise RuntimeError("game update failed")
 
 
+class _ConcurrentMoveStore:
+    def __init__(self, game: Game) -> None:
+        self.game = replace(game)
+        self.moves: list[Move] = []
+        self.lock = asyncio.Lock()
+        self.unlocked_move_readers = 0
+        self.unlocked_moves_read = asyncio.Event()
+        self.commits = 0
+        self.rollbacks = 0
+        self.next_move_id = 1
+
+    def repository(self) -> "_ConcurrentMoveRepository":
+        return _ConcurrentMoveRepository(self)
+
+
+class _ConcurrentMoveRepository:
+    def __init__(self, store: _ConcurrentMoveStore) -> None:
+        self._store = store
+        self._pending_game: Game | None = None
+        self._pending_moves: list[Move] = []
+        self._held_lock = False
+
+    async def get_by_id(self, game_id):
+        if game_id != self._store.game.id:
+            return None
+        return replace(self._store.game)
+
+    async def get_by_id_for_update(self, game_id):
+        await self._store.lock.acquire()
+        self._held_lock = True
+        return await self.get_by_id(game_id)
+
+    async def get_moves(self, game_id):
+        moves = [replace(move) for move in self._store.moves if move.game_id == game_id]
+        if not self._held_lock:
+            self._store.unlocked_move_readers += 1
+            if self._store.unlocked_move_readers == 2:
+                self._store.unlocked_moves_read.set()
+            await self._store.unlocked_moves_read.wait()
+        return moves
+
+    async def add_move(self, move):
+        saved = replace(move, id=self._store.next_move_id)
+        self._store.next_move_id += 1
+        self._pending_moves.append(saved)
+        return replace(saved)
+
+    async def update(self, game):
+        self._pending_game = replace(game)
+        return replace(game)
+
+    async def commit(self) -> None:
+        if self._pending_game is not None:
+            self._store.game = replace(self._pending_game)
+        self._store.moves.extend(replace(move) for move in self._pending_moves)
+        self._pending_game = None
+        self._pending_moves = []
+        self._store.commits += 1
+        self._release_lock()
+
+    async def rollback(self) -> None:
+        self._pending_game = None
+        self._pending_moves = []
+        self._store.rollbacks += 1
+        self._release_lock()
+
+    def _release_lock(self) -> None:
+        if self._held_lock:
+            self._held_lock = False
+            self._store.lock.release()
+
+
 def _clone_model(model):
     values = {column.name: getattr(model, column.name) for column in model.__table__.columns}
     return type(model)(**values)
@@ -168,3 +248,103 @@ async def test_make_move_rolls_back_move_when_game_update_fails(monkeypatch):
     assert persisted_game.white_time_ms == 300_000
     assert persisted_game.black_time_ms == 300_000
     assert persisted_game.status == GameStatus.ACTIVE
+
+
+def test_move_model_declares_unique_game_move_number_constraint():
+    constraints = {
+        constraint.name: constraint
+        for constraint in MoveModel.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+
+    constraint = constraints.get("uq_moves_game_move_number")
+
+    assert constraint is not None
+    assert tuple(column.name for column in constraint.columns) == ("game_id", "move_number")
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_moves_from_same_position_serialize_to_one_commit(monkeypatch):
+    game_id = uuid4()
+    white_id = uuid4()
+    black_id = uuid4()
+    started_at = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+    store = _ConcurrentMoveStore(
+        Game(
+            id=game_id,
+            white_id=white_id,
+            black_id=black_id,
+            initial_time_ms=300_000,
+            increment_ms=0,
+            white_time_ms=300_000,
+            black_time_ms=300_000,
+            last_clock_started_at=started_at,
+            fen=DEFAULT_GAME_START_FEN,
+            started_at=started_at,
+            status=GameStatus.ACTIVE,
+        )
+    )
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: started_at)
+
+    results = await asyncio.gather(
+        GameService(store.repository()).make_move(MakeMoveCommand(game_id=game_id, user_id=white_id, uci="e2e4")),
+        GameService(store.repository()).make_move(MakeMoveCommand(game_id=game_id, user_id=white_id, uci="d2d4")),
+        return_exceptions=True,
+    )
+    successful_moves = [result for result in results if not isinstance(result, Exception)]
+
+    assert len(successful_moves) == 1
+    assert store.commits == 1
+    assert [move.move_number for move in store.moves] == [1]
+
+
+class _MoveInsertOrig:
+    def __init__(self, constraint_name: str) -> None:
+        self.constraint_name = constraint_name
+
+class _MoveInsertIntegritySession:
+    def __init__(self, constraint_name: str) -> None:
+        self.orig = _MoveInsertOrig(constraint_name)
+        self.added: list[object] = []
+        self.rollbacks = 0
+
+    def add(self, model: object) -> None:
+        self.added.append(model)
+
+    async def flush(self) -> None:
+        raise IntegrityError("insert into moves", {}, self.orig)
+
+    async def refresh(self, _model: object) -> None:
+        raise AssertionError("failed move inserts are not refreshed")
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+@pytest.mark.asyncio
+async def test_add_move_maps_named_unique_violation_to_concurrent_move_conflict():
+    session = _MoveInsertIntegritySession("uq_moves_game_move_number")
+    repo = SqlAlchemyGameRepository(session)
+    move = Move(
+        game_id=uuid4(), user_id=uuid4(), uci="e2e4", fen_after="fen", move_number=1
+    )
+
+    with pytest.raises(ConcurrentMoveConflict) as exc_info:
+        await repo.add_move(move)
+
+    assert isinstance(exc_info.value.__cause__, IntegrityError)
+    assert exc_info.value.__cause__.orig is session.orig
+    assert session.rollbacks == 1
+
+@pytest.mark.asyncio
+async def test_add_move_leaves_unrelated_integrity_error_unchanged():
+    session = _MoveInsertIntegritySession("uq_moves_unrelated")
+    repo = SqlAlchemyGameRepository(session)
+    move = Move(
+        game_id=uuid4(), user_id=uuid4(), uci="e2e4", fen_after="fen", move_number=1
+    )
+
+    with pytest.raises(IntegrityError) as exc_info:
+        await repo.add_move(move)
+
+    assert exc_info.value.orig is session.orig
+    assert session.rollbacks == 0

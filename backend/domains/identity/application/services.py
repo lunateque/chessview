@@ -112,6 +112,10 @@ class IdentityService:
         if user_id is None:
             raise InvalidCredentials()
 
+        user = await self._repo.get_by_id(UUID(str(user_id)))
+        if user is None or user.banned_at is not None:
+            raise InvalidCredentials()
+
         return self._build_token_pair(str(user_id))
 
     async def request_password_reset(self, cmd: RequestPasswordResetCommand) -> PasswordResetTicket | None:

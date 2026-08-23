@@ -37,6 +37,14 @@ class AbstractTournamentRepository(ABC):
         ...
 
     @abstractmethod
+    async def has_confirmed_entry_payment(
+        self,
+        tournament_id: UUID,
+        user_id: UUID,
+        minimum_amount_cents: int,
+    ) -> bool: ...
+
+    @abstractmethod
     async def list_players(self, tournament_id: UUID) -> list[TournamentPlayer]:
         ...
 
@@ -75,3 +83,9 @@ class AbstractTournamentRepository(ABC):
     @abstractmethod
     async def update_pairing(self, pairing: TournamentPairing) -> TournamentPairing:
         ...
+
+
+    @abstractmethod
+    async def get_tournament_for_update(
+        self, tournament_id: UUID
+    ) -> Tournament | None: ...

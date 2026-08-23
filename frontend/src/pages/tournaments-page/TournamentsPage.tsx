@@ -215,9 +215,15 @@ export default function TournamentsPage() {
                       {tournament.status === "registration" ? (
                         <>
                           {!tournament.viewer_is_member ? (
-                            <Button size="sm" onClick={() => joinTournament.mutate(tournament.id)} disabled={joinTournament.isPending}>
-                              Join
-                            </Button>
+                            tournament.entry_fee_cents > 0 ? (
+                              <Button size="sm" onClick={() => navigate(`/tournaments/${tournament.id}`)}>
+                                Reserve Entry
+                              </Button>
+                            ) : (
+                              <Button size="sm" onClick={() => joinTournament.mutate(tournament.id)} disabled={joinTournament.isPending}>
+                                Join
+                              </Button>
+                            )
                           ) : null}
                           {tournament.viewer_is_member && !isLeavingOwner ? (
                             <Button

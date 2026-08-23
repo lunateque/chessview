@@ -173,12 +173,12 @@ test.describe("real Docker stack workflows", () => {
     await page.goto(`/tournaments/${tournament.id}`);
     await expect(page.getByText(`E2E Swiss ${suffix}`)).toBeVisible();
 
-    const adminSession = await login(api, "admin@chessview.app", "admin123");
+    const adminSession = await login(api, "admin@chessview.app", "dev-only-not-a-secret");
     expect(adminSession.user.role).toBe("admin");
     const adminPage = await browser.newPage();
     await adminPage.goto(adminUrl);
     await adminPage.getByLabel(/email/i).fill("admin@chessview.app");
-    await adminPage.getByLabel(/password/i).fill("admin123");
+    await adminPage.getByLabel(/password/i).fill("dev-only-not-a-secret");
     await adminPage.getByRole("button", { name: /sign in|login/i }).click();
     await expect(adminPage.getByText(/admin/i).first()).toBeVisible();
     await expect(adminPage.getByText(new RegExp(`alice${suffix}`, "i")).first()).toBeVisible();

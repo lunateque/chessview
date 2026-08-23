@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     FIRST_ADMIN_EMAIL: str | None = None
     SEED_ADMIN_EMAIL: str = "admin@chessview.app"
     SEED_ADMIN_USERNAME: str = "admin"
-    SEED_ADMIN_PASSWORD: str = "admin123"
+    SEED_ADMIN_PASSWORD: str = ""
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
     SMTP_USERNAME: str = ""

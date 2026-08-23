@@ -23,4 +23,4 @@ class PaymentIntentResponse(BaseModel):
 
 
 class PaymentSimulationRequest(BaseModel):
-    scenario: str = Field(pattern="^(success|failed|pending|cancelled|expired|refunded|disputed)$")
+    scenario: str = Field(pattern="^(success|failed|pending|cancelled|expired)$")

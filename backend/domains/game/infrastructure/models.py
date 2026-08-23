@@ -7,7 +7,7 @@ Domain layer must never import this module.
 from datetime import datetime
 import uuid
 
-from sqlalchemy import Boolean, Index, Integer, String, Text, text
+from sqlalchemy import Boolean, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from infrastructure.database import Base
@@ -49,6 +49,10 @@ class GameModel(Base):
     last_clock_started_at: Mapped[datetime | None] = utc_timestamp_column(nullable=True)
     disconnected_player_id: Mapped[uuid.UUID | None] = uuid_reference("users.id", nullable=True)
     disconnect_grace_deadline_at: Mapped[datetime | None] = utc_timestamp_column(nullable=True)
+    pending_draw_offer_by_user_id: Mapped[uuid.UUID | None] = uuid_reference("users.id", nullable=True)
+    pending_draw_offer_at: Mapped[datetime | None] = utc_timestamp_column(nullable=True)
+    white_disconnect_grace_remaining_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("20000"))
+    black_disconnect_grace_remaining_ms: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("20000"))
 
     rated: Mapped[bool] = mapped_column(Boolean, nullable=False)
     white_rating_before: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -75,6 +79,10 @@ class MoveModel(Base):
     """ORM model for the `moves` table."""
 
     __tablename__ = "moves"
+    __table_args__ = (
+        UniqueConstraint("game_id", "move_number", name="uq_moves_game_move_number"),
+    )
+
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     game_id: Mapped[uuid.UUID] = uuid_reference("games.id")

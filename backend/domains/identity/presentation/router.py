@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,9 +65,24 @@ from infrastructure.security import (
     hash_password,
     verify_password,
 )
+from shared.rate_limit import check as check_rate_limit
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+IDENTITY_RATE_LIMIT = 10
+IDENTITY_RATE_WINDOW_S = 300
+
+
+async def _rate_limit_identity(request: Request) -> None:
+    identity = request.client.host if request.client else "unknown"
+    try:
+        allowed = await check_rate_limit("identity", identity, IDENTITY_RATE_LIMIT, IDENTITY_RATE_WINDOW_S)
+    except Exception:
+        logger.warning("Identity rate limit unavailable; allowing request", exc_info=True)
+        return
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts")
+
 
 AVATAR_STORAGE_DIR = settings.resolved_storage_dir / "avatars"
 MAX_AVATAR_SIZE_BYTES = 2 * 1024 * 1024
@@ -136,7 +151,12 @@ async def _delete_avatar_file(avatar_name: str | None) -> None:
     except Exception as e:
         logger.error(f"Failed to delete avatar file: {e}")
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=TokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_rate_limit_identity)],
+)
 async def register(body: RegisterRequest, session: AsyncSession = Depends(get_db)):
     service = _build_service(session)
     try:
@@ -148,7 +168,7 @@ async def register(body: RegisterRequest, session: AsyncSession = Depends(get_db
     except DuplicateUsername:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, dependencies=[Depends(_rate_limit_identity)])
 async def login(body: LoginRequest, session: AsyncSession = Depends(get_db)):
     service = _build_service(session)
     try:
@@ -165,7 +185,11 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
 
 
-@router.post("/password-reset/request", response_model=PasswordResetRequestResponse)
+@router.post(
+    "/password-reset/request",
+    response_model=PasswordResetRequestResponse,
+    dependencies=[Depends(_rate_limit_identity)],
+)
 async def request_password_reset(body: PasswordResetRequest, session: AsyncSession = Depends(get_db)):
     service = _build_service(session)
     ticket = await service.request_password_reset(

@@ -22,8 +22,18 @@ class AbstractGameRepository(ABC):
         ...
 
     @abstractmethod
+    async def get_by_id_for_update(self, game_id: UUID) -> Game | None:
+        """Retrieve a game by primary key and lock it for mutation."""
+        ...
+
+    @abstractmethod
     async def get_active_by_user(self, user_id: UUID) -> Game | None:
         """Retrieve the user's active game if one exists."""
+        ...
+
+    @abstractmethod
+    async def get_active_by_user_for_update(self, user_id: UUID) -> Game | None:
+        """Retrieve the user's active game and lock it for mutation."""
         ...
 
     @abstractmethod

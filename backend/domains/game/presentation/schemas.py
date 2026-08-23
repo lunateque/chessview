@@ -38,6 +38,8 @@ class GameListItem(BaseModel):
     result: str | None
     status: str
     termination_reason: str | None = None
+    pending_draw_offer_by_user_id: str | None = None
+    pending_draw_offer_at: datetime | None = None
     move_count: int
     rating_delta: int | None = None
     started_at: datetime
@@ -82,6 +84,8 @@ class GameDetailResponse(BaseModel):
     result: str | None
     fen: str
     pgn: str | None
+    pending_draw_offer_by_user_id: str | None = None
+    pending_draw_offer_at: datetime | None = None
     move_count: int
     clock: ClockStateResponse
     white_rating: RatingSummaryResponse | None = None

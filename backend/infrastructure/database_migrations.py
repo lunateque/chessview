@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI_PATH = PROJECT_ROOT / "alembic.ini"
 ALEMBIC_SCRIPT_PATH = PROJECT_ROOT / "alembic"
 BASELINE_REVISION = "0001_baseline"
-HEAD_REVISION = "0011_game_player_history_indexes"
+HEAD_REVISION = "0012_game_state_integrity"
 BASELINE_TABLES = frozenset(
     {
         "chat_messages",
@@ -35,6 +35,27 @@ BASELINE_TABLES = frozenset(
     }
 )
 LEGACY_SCHEMA_FIX_SQL = """
+ALTER TABLE games ADD COLUMN IF NOT EXISTS pending_draw_offer_by_user_id UUID;
+ALTER TABLE games ADD COLUMN IF NOT EXISTS pending_draw_offer_at TIMESTAMPTZ;
+ALTER TABLE games ADD COLUMN IF NOT EXISTS white_disconnect_grace_remaining_ms INTEGER NOT NULL DEFAULT 20000;
+ALTER TABLE games ADD COLUMN IF NOT EXISTS black_disconnect_grace_remaining_ms INTEGER NOT NULL DEFAULT 20000;
+
+UPDATE games
+SET white_disconnect_grace_remaining_ms = GREATEST(
+    0,
+    (EXTRACT(EPOCH FROM (disconnect_grace_deadline_at - now())) * 1000)::integer
+)
+WHERE disconnected_player_id = white_id
+  AND disconnect_grace_deadline_at IS NOT NULL;
+
+UPDATE games
+SET black_disconnect_grace_remaining_ms = GREATEST(
+    0,
+    (EXTRACT(EPOCH FROM (disconnect_grace_deadline_at - now())) * 1000)::integer
+)
+WHERE disconnected_player_id = black_id
+  AND disconnect_grace_deadline_at IS NOT NULL;
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -46,6 +67,40 @@ BEGIN
         ADD CONSTRAINT fk_games_disconnected_player_id_users
         FOREIGN KEY (disconnected_player_id)
         REFERENCES users (id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_games_pending_draw_offer_by_user_id_users'
+    ) THEN
+        ALTER TABLE games
+        ADD CONSTRAINT fk_games_pending_draw_offer_by_user_id_users
+        FOREIGN KEY (pending_draw_offer_by_user_id)
+        REFERENCES users (id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'uq_moves_game_move_number'
+    ) THEN
+        IF EXISTS (
+            SELECT 1
+            FROM (
+                SELECT game_id, move_number
+                FROM moves
+                GROUP BY game_id, move_number
+                HAVING count(*) > 1
+                LIMIT 1
+            ) duplicate_moves
+        ) THEN
+            RAISE EXCEPTION 'Cannot add uq_moves_game_move_number while duplicate move numbers exist';
+        END IF;
+
+        ALTER TABLE moves
+        ADD CONSTRAINT uq_moves_game_move_number
+        UNIQUE (game_id, move_number);
     END IF;
 END $$;
 """

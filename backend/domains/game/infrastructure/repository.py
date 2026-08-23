@@ -7,9 +7,11 @@ Converts between ORM models and domain entities.
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from domains.game.domain.entities import Game, Move
+from domains.game.domain.exceptions import ConcurrentMoveConflict
 from domains.game.domain.repository import AbstractGameRepository
 from domains.game.domain.value_objects import GameResult, GameStatus
 from domains.game.infrastructure.models import GameModel, MoveModel
@@ -31,6 +33,10 @@ class SqlAlchemyGameRepository(AbstractGameRepository):
         model = await self._get_game_model(game_id)
         return self._to_game_entity(model) if model else None
 
+    async def get_by_id_for_update(self, game_id: UUID) -> Game | None:
+        model = await self._get_game_model(game_id, for_update=True)
+        return self._to_game_entity(model) if model else None
+
     async def get_active_by_user(self, user_id: UUID) -> Game | None:
         stmt = (
             select(GameModel)
@@ -40,6 +46,21 @@ class SqlAlchemyGameRepository(AbstractGameRepository):
             )
             .order_by(GameModel.started_at.desc())
             .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        model = result.scalar_one_or_none()
+        return self._to_game_entity(model) if model else None
+
+    async def get_active_by_user_for_update(self, user_id: UUID) -> Game | None:
+        stmt = (
+            select(GameModel)
+            .where(
+                or_(GameModel.white_id == user_id, GameModel.black_id == user_id),
+                GameModel.status == GameStatus.ACTIVE,
+            )
+            .order_by(GameModel.started_at.desc())
+            .limit(1)
+            .with_for_update()
         )
         result = await self._session.execute(stmt)
         model = result.scalar_one_or_none()
@@ -80,7 +101,13 @@ class SqlAlchemyGameRepository(AbstractGameRepository):
     async def add_move(self, move: Move) -> Move:
         model = self._new_move_model(move)
         self._session.add(model)
-        await self._persist(model)
+        try:
+            await self._persist(model)
+        except IntegrityError as exc:
+            if _constraint_name(exc) == "uq_moves_game_move_number":
+                await self._session.rollback()
+                raise ConcurrentMoveConflict() from exc
+            raise
         return self._to_move_entity(model)
 
     async def commit(self) -> None:
@@ -130,6 +157,10 @@ class SqlAlchemyGameRepository(AbstractGameRepository):
         model.last_clock_started_at = game.last_clock_started_at
         model.disconnected_player_id = game.disconnected_player_id
         model.disconnect_grace_deadline_at = game.disconnect_grace_deadline_at
+        model.pending_draw_offer_by_user_id = game.pending_draw_offer_by_user_id
+        model.pending_draw_offer_at = game.pending_draw_offer_at
+        model.white_disconnect_grace_remaining_ms = game.white_disconnect_grace_remaining_ms
+        model.black_disconnect_grace_remaining_ms = game.black_disconnect_grace_remaining_ms
         model.rated = game.rated
         model.white_rating_before = game.white_rating_before
         model.black_rating_before = game.black_rating_before
@@ -168,6 +199,10 @@ class SqlAlchemyGameRepository(AbstractGameRepository):
             last_clock_started_at=model.last_clock_started_at,
             disconnected_player_id=model.disconnected_player_id,
             disconnect_grace_deadline_at=model.disconnect_grace_deadline_at,
+            pending_draw_offer_by_user_id=model.pending_draw_offer_by_user_id,
+            pending_draw_offer_at=model.pending_draw_offer_at,
+            white_disconnect_grace_remaining_ms=model.white_disconnect_grace_remaining_ms,
+            black_disconnect_grace_remaining_ms=model.black_disconnect_grace_remaining_ms,
             rated=model.rated,
             white_rating_before=model.white_rating_before,
             black_rating_before=model.black_rating_before,
@@ -195,10 +230,28 @@ class SqlAlchemyGameRepository(AbstractGameRepository):
             created_at=model.created_at,
         )
 
-    async def _get_game_model(self, game_id: UUID) -> GameModel | None:
-        result = await self._session.execute(select(GameModel).where(GameModel.id == game_id))
+    async def _get_game_model(self, game_id: UUID, *, for_update: bool = False) -> GameModel | None:
+        stmt = select(GameModel).where(GameModel.id == game_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
     async def _persist(self, model: GameModel | MoveModel) -> None:
         await self._session.flush()
         await self._session.refresh(model)
+
+
+def _constraint_name(exc: IntegrityError) -> str | None:
+    orig = exc.orig
+    for attr in ("constraint_name", "constraint"):
+        value = getattr(orig, attr, None)
+        if value:
+            return str(value)
+    diag = getattr(orig, "diag", None)
+    value = getattr(diag, "constraint_name", None) if diag is not None else None
+    if value:
+        return str(value)
+    if "uq_moves_game_move_number" in str(orig):
+        return "uq_moves_game_move_number"
+    return None

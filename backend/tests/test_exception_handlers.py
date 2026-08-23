@@ -1,7 +1,17 @@
 from domains.communication.domain.exceptions import MessageTooLong
-from domains.game.domain.exceptions import GameNotFound, IllegalMove, NotYourTurn
+from domains.game.domain.exceptions import (
+    ConcurrentMoveConflict,
+    DrawOfferNotAcceptable,
+    DrawOfferNotFound,
+    DrawOfferPending,
+    GameNotFound,
+    IllegalMove,
+    NotYourTurn,
+)
 from domains.identity.domain.exceptions import DuplicateEmail
 from shared.exception_handlers import map_exception_to_http, map_exception_to_ws_error
+
+
 
 
 def test_http_exception_mapping_for_domain_errors():
@@ -39,6 +49,28 @@ def test_ws_exception_mapping_for_chat_validation():
     assert map_exception_to_ws_error(MessageTooLong()) == (
         "MESSAGE_TOO_LONG",
         "Chat messages cannot exceed 500 characters",
+    )
+
+
+def test_ws_exception_mapping_for_draw_offer_lifecycle_errors():
+    assert map_exception_to_ws_error(DrawOfferPending()) == (
+        "DRAW_OFFER_PENDING",
+        "A draw offer is already pending",
+    )
+    assert map_exception_to_ws_error(DrawOfferNotFound()) == (
+        "DRAW_OFFER_NOT_FOUND",
+        "No draw offer is pending",
+    )
+    assert map_exception_to_ws_error(DrawOfferNotAcceptable()) == (
+        "DRAW_OFFER_NOT_ACCEPTABLE",
+        "Only the opponent can accept or decline this draw offer",
+    )
+
+
+def test_ws_exception_mapping_for_move_conflict():
+    assert map_exception_to_ws_error(ConcurrentMoveConflict()) == (
+        "MOVE_CONFLICT",
+        "Another move was committed first",
     )
 
 

@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from domains.payments.infrastructure.models import PaymentIntentModel
 from domains.tournaments.domain.entities import (
     Tournament,
     TournamentPairing,
@@ -12,7 +13,12 @@ from domains.tournaments.domain.entities import (
     TournamentRound,
 )
 from domains.tournaments.domain.repository import AbstractTournamentRepository
-from domains.tournaments.domain.value_objects import PairingResult, TournamentPlayerStatus, TournamentStatus, TournamentType
+from domains.tournaments.domain.value_objects import (
+    PairingResult,
+    TournamentPlayerStatus,
+    TournamentStatus,
+    TournamentType,
+)
 from domains.tournaments.infrastructure.models import (
     TournamentModel,
     TournamentPairingModel,
@@ -65,6 +71,24 @@ class SqlAlchemyTournamentRepository(AbstractTournamentRepository):
         )
         model = result.scalar_one_or_none()
         return self._to_player(model) if model else None
+
+    async def has_confirmed_entry_payment(
+        self,
+        tournament_id: UUID,
+        user_id: UUID,
+        minimum_amount_cents: int,
+    ) -> bool:
+        result = await self._session.execute(
+            select(PaymentIntentModel.id)
+            .where(
+                PaymentIntentModel.tournament_id == tournament_id,
+                PaymentIntentModel.user_id == user_id,
+                PaymentIntentModel.status == "succeeded",
+                PaymentIntentModel.amount_cents >= minimum_amount_cents,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def list_players(self, tournament_id: UUID) -> list[TournamentPlayer]:
         result = await self._session.execute(
@@ -275,9 +299,12 @@ class SqlAlchemyTournamentRepository(AbstractTournamentRepository):
             created_at=model.created_at,
         )
 
-    async def _get_tournament_model(self, tournament_id: UUID) -> TournamentModel | None:
-        result = await self._session.execute(select(TournamentModel).where(TournamentModel.id == tournament_id))
-        return result.scalar_one_or_none()
+    async def _get_tournament_model(
+        self, tournament_id: UUID
+    ) -> TournamentModel | None:
+        return await self._session.get(
+            TournamentModel, tournament_id, with_for_update=True
+        )
 
     async def _persist(
         self,
@@ -285,3 +312,8 @@ class SqlAlchemyTournamentRepository(AbstractTournamentRepository):
     ) -> None:
         await self._session.commit()
         await self._session.refresh(model)
+
+
+    async def get_tournament_for_update(self, tournament_id: UUID) -> Tournament | None:
+        model = await self._get_tournament_model(tournament_id)
+        return self._to_tournament(model) if model else None

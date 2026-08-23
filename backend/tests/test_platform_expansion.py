@@ -8,10 +8,16 @@ from fastapi import HTTPException
 from app.dependencies import require_admin
 from domains.identity.application.services import IdentityService
 from domains.game.domain.value_objects import GameResult, GameStatus
-from domains.game.application.commands import AcceptDrawCommand, IdentityVerificationFailureCommand, ResignCommand
+from domains.game.application.commands import (
+    AcceptDrawCommand,
+    IdentityVerificationFailureCommand,
+    ResignCommand,
+)
 from domains.game.application.services import GameService
 from domains.game.domain.exceptions import GameAccessDenied
-from domains.identity.face_verification.provider import LocalStubFaceVerificationProvider
+from domains.identity.face_verification.provider import (
+    LocalStubFaceVerificationProvider,
+)
 from domains.identity.face_verification.service import (
     FaceVerificationService,
     has_completed_face_verification,
@@ -34,11 +40,17 @@ from domains.ratings.infrastructure.repository import SqlAlchemyRatingRepository
 from domains.profiles.application.head_to_head import HeadToHeadService
 from domains.profiles.application.head_to_head import _Stats
 from domains.profiles.infrastructure.repository import SqlAlchemyProfileRepository
-from domains.scheduled_matches.service import validate_scheduled_match_start, validate_scheduled_match_transition
+from domains.scheduled_matches.service import (
+    validate_scheduled_match_start,
+    validate_scheduled_match_transition,
+)
 from domains.scheduled_matches.service import ScheduledMatchService
 from domains.scheduled_matches.infrastructure.models import ScheduledMatchModel
 from domains.tournaments.application.services import TournamentService
-from domains.tournaments.infrastructure.models import TournamentModel, TournamentPairingModel
+from domains.tournaments.infrastructure.models import (
+    TournamentModel,
+    TournamentPairingModel,
+)
 from domains.tournaments.infrastructure.models import TournamentPlayerModel
 from domains.tournaments.domain.entities import TournamentPairing, TournamentPlayer
 from domains.tournaments.domain.services import (
@@ -47,9 +59,17 @@ from domains.tournaments.domain.services import (
     performance_scores,
     plan_swiss_pairings,
 )
-from domains.tournaments.domain.value_objects import PairingResult, TournamentPlayerStatus
+from domains.tournaments.domain.value_objects import (
+    PairingResult,
+    TournamentPlayerStatus,
+)
 from domains.tournaments.domain.value_objects import TournamentType
-from shared.time_controls import RatingSpeed, TimeControl, rating_speed_for_clock, rating_speed_for_time_control_name
+from shared.time_controls import (
+    RatingSpeed,
+    TimeControl,
+    rating_speed_for_clock,
+    rating_speed_for_time_control_name,
+)
 
 
 def _player(score: float = 0.0, *, status=TournamentPlayerStatus.ACTIVE) -> TournamentPlayer:
@@ -276,9 +296,11 @@ async def test_duplicate_payment_success_does_not_add_duplicate_registration():
     from domains.payments.service import PaymentService
 
     session = FakeSession()
-    await PaymentService(session)._confirm_registration(payment)
+    with pytest.raises(HTTPException) as exc_info:
+        await PaymentService(session)._confirm_registration(payment)
 
     assert session.added == []
+    assert exc_info.value.status_code == 409
 
 
 def test_scheduled_match_lifecycle_rejects_self_accept_and_start_before_acceptance():
@@ -753,6 +775,9 @@ async def test_identity_verification_failure_forfeits_active_game_for_opponent()
             assert game_id == game.id
             return game
 
+        async def get_by_id_for_update(self, game_id):
+            return await self.get_by_id(game_id)
+
         async def update(self, updated_game):
             self.updated = updated_game
             return updated_game
@@ -802,6 +827,12 @@ async def test_identity_verification_failure_cannot_forfeit_when_user_is_not_pla
             assert game_id == game.id
             return game
 
+        async def get_by_id_for_update(self, game_id):
+            return await self.get_by_id(game_id)
+
+        async def rollback(self):
+            return None
+
         async def update(self, _updated_game):
             raise AssertionError("non-player identity failure must not update the game")
 
@@ -836,6 +867,12 @@ async def test_nonparticipant_cannot_resign_or_accept_draw_for_game():
         async def get_by_id(self, game_id):
             assert game_id == game.id
             return game
+
+        async def get_by_id_for_update(self, game_id):
+            return await self.get_by_id(game_id)
+
+        async def rollback(self):
+            return None
 
         async def update(self, _updated_game):
             raise AssertionError("non-player action must not update the game")
