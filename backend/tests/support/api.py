@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, FastAPI
@@ -37,7 +37,7 @@ class MemorySession:
         if key is not None:
             self.store[(type(item), key)] = item
 
-    async def get(self, model: Any, key: Any) -> Any | None:
+    async def get(self, model: Any, key: Any, **_kwargs: Any) -> Any | None:
         return self.store.get((model, key))
 
     async def execute(self, statement: Any) -> ScalarResult:

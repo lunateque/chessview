@@ -19,7 +19,9 @@ async def seed_first_admin(engine: AsyncEngine) -> None:
 
         if settings.FIRST_ADMIN_EMAIL:
             result = await session.execute(
-                select(UserModel).where(func.lower(UserModel.email) == settings.FIRST_ADMIN_EMAIL.lower())
+                select(UserModel).where(
+                    func.lower(UserModel.email) == settings.FIRST_ADMIN_EMAIL.lower()
+                )
             )
             first_admin = result.scalar_one_or_none()
             if first_admin is not None and first_admin.role != "admin":
@@ -27,10 +29,16 @@ async def seed_first_admin(engine: AsyncEngine) -> None:
                 changed = True
 
         if seed_email and seed_password:
-            result = await session.execute(select(UserModel).where(func.lower(UserModel.email) == seed_email))
+            result = await session.execute(
+                select(UserModel).where(func.lower(UserModel.email) == seed_email)
+            )
             seeded_admin = result.scalar_one_or_none()
             if seeded_admin is None:
-                result = await session.execute(select(UserModel).where(func.lower(UserModel.username) == seed_username.lower()))
+                result = await session.execute(
+                    select(UserModel).where(
+                        func.lower(UserModel.username) == seed_username.lower()
+                    )
+                )
                 seeded_admin = result.scalar_one_or_none()
 
             if seeded_admin is None:
@@ -50,12 +58,9 @@ async def seed_first_admin(engine: AsyncEngine) -> None:
                     )
                 )
                 changed = True
-            else:
+            elif seeded_admin.role == "admin":
                 if seeded_admin.email.lower() != seed_email:
                     seeded_admin.email = seed_email
-                    changed = True
-                if seeded_admin.role != "admin":
-                    seeded_admin.role = "admin"
                     changed = True
                 if seeded_admin.banned_at is not None:
                     seeded_admin.banned_at = None

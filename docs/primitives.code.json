@@ -307,35 +307,35 @@
    "snippets": [
     {
      "file": "backend/domains/game/application/services.py",
-     "start": 63,
-     "end": 84,
+     "start": 67,
+     "end": 88,
      "sha256": "bc61673b69a356069dceccdd4035980bb613def7f0dce03854d68d85ceafd21b",
      "first": "async def make_move(self, cmd: MakeMoveCommand) -> tuple[Game, Move | None]:",
      "last": ")",
      "why": "Часы считает сервер: клиент присылает только ход, а истечение времени проверяется до его применения.",
      "notes": [
       {
-       "line": 66,
+       "line": 70,
        "code": "game = await self._require_active_game_for_update(cmd.game_id)",
        "text": "Игра блокируется и читается из базы - клиент не может подменить authoritative clock state."
       },
       {
-       "line": 68,
+       "line": 72,
        "code": "now = utc_now()",
        "text": "Время берётся на сервере. Клиент не участвует в определении «сейчас»."
       },
       {
-       "line": 72,
+       "line": 76,
        "code": "expired_game = await self._expire_on_clock_if_needed(game, now)",
        "text": "Проверка на истечение часов идёт ДО применения хода: иначе игрок с просроченным временем успел бы сходить."
       },
       {
-       "line": 74,
+       "line": 78,
        "code": "return expired_game, None",
        "text": "Если время вышло, ход не применяется вовсе, а игра завершается по флагу."
       },
       {
-       "line": 77,
+       "line": 81,
        "code": "move_entity = apply_player_move(",
        "text": "Ход применяется к доменному объекту, и там же начисляется increment — на стороне сервера."
       }
@@ -812,30 +812,30 @@
    "snippets": [
     {
      "file": "backend/domains/game/application/services.py",
-     "start": 36,
-     "end": 41,
+     "start": 40,
+     "end": 45,
      "sha256": "5181af35e723c5696b8fa9e5bb39d8f4748a3888c643207ca8c7950a80defb56",
      "first": "def utc_now() -> datetime:",
      "last": "return capture_clock_snapshot(game, now or utc_now()).to_payload()",
      "why": "Этот helper показывает источник времени, который сейчас используется вместо monotonic timer.",
      "notes": [
       {
-       "line": 36,
+       "line": 40,
        "code": "def utc_now() -> datetime:",
        "text": "utc_now — общий entry point service layer для текущего времени игры."
       },
       {
-       "line": 37,
+       "line": 41,
        "code": "return datetime.now(timezone.utc)",
        "text": "datetime.now(timezone.utc) — wall-clock call; она может прыгнуть из-за NTP correction, DST настройки хоста или ручного изменения."
       },
       {
-       "line": 40,
+       "line": 44,
        "code": "def current_clock_snapshot(game: Game, now: datetime | None = None) -> dict:",
        "text": "current_clock_snapshot позволяет тестам передать fixed now, но production path обычно берет utc_now."
       },
       {
-       "line": 41,
+       "line": 45,
        "code": "return capture_clock_snapshot(game, now or utc_now()).to_payload()",
        "text": "Без явно переданного now snapshot получает wall-clock instant из utc_now и на нем строит clock payload."
       }
@@ -1029,60 +1029,60 @@
     },
     {
      "file": "backend/domains/game/application/services.py",
-     "start": 185,
-     "end": 256,
-     "sha256": "88147f88f17f28aa2aca0fb846c85098e2512b911bf700a5119188756c940abc",
+     "start": 189,
+     "end": 262,
+     "sha256": "2e3da5bbfc5bc44fea1b924b92dc081e942fbeaa44848620e15603b06454848f",
      "first": "async def mark_disconnected(self, user_id: UUID) -> Game | None:",
      "last": "return None",
      "why": "Disconnect, reconnect и monitor используют сохраненный бюджет и locked reads перед изменением результата.",
      "notes": [
       {
-       "line": 185,
+       "line": 189,
        "code": "async def mark_disconnected(self, user_id: UUID) -> Game | None:",
        "text": "Socket drop входит в одну транзакцию изменения активной игры."
       },
       {
-       "line": 187,
+       "line": 191,
        "code": "game = await self._repo.get_active_by_user_for_update(user_id)",
        "text": "Row lock сериализует disconnect с ходом, reconnect и monitor."
       },
       {
-       "line": 198,
+       "line": 202,
        "code": "remaining_ms = self._disconnect_grace_remaining_ms(game, user_id)",
        "text": "Новый deadline строится из сохраненного остатка конкретного игрока."
       },
       {
-       "line": 203,
+       "line": 207,
        "code": "pause_for_disconnect(game, user_id, snapshot, now, remaining_ms)",
        "text": "Часы замораживаются, а остаток grace budget превращается в deadline."
       },
       {
-       "line": 209,
+       "line": 213,
        "code": "async def mark_reconnected(self, user_id: UUID) -> Game | None:",
        "text": "Reconnect входит через тот же locked repository path."
       },
       {
-       "line": 215,
+       "line": 219,
        "code": "if game.disconnect_grace_deadline_at is not None and game.disconnect_grace_deadline_at <= now:",
        "text": "Reconnect на deadline или позже сначала завершает просроченную игру."
       },
       {
-       "line": 221,
+       "line": 225,
        "code": "resume_after_reconnect(game, now)",
        "text": "Успешный reconnect сохраняет остаток бюджета и снова запускает шахматные часы."
       },
       {
-       "line": 227,
+       "line": 231,
        "code": "async def monitor_active_games(self) -> list[Game]:",
        "text": "Monitor обрабатывает просроченные disconnect и clock deadlines."
       },
       {
-       "line": 232,
+       "line": 238,
        "code": "game = await self._repo.get_by_id_for_update(candidate.id)",
        "text": "Перед решением monitor повторно читает и блокирует актуальную строку игры."
       },
       {
-       "line": 248,
+       "line": 254,
        "code": "if game.disconnect_grace_deadline_at is not None and game.disconnect_grace_deadline_at <= now:",
        "text": "Только актуальный locked state может превратить grace deadline в terminal outcome."
       }
@@ -1096,55 +1096,55 @@
    "snippets": [
     {
      "file": "backend/domains/game/application/services.py",
-     "start": 63,
-     "end": 90,
+     "start": 67,
+     "end": 94,
      "sha256": "73229f9b12d3270640e1d054afeff94c7bf073cce13a99f04303d83364f699ac",
      "first": "async def make_move(self, cmd: MakeMoveCommand) -> tuple[Game, Move | None]:",
      "last": "return game, move_entity",
      "why": "Сервис блокирует игру, ставит move и game update в одну сессию и коммитит их один раз.",
      "notes": [
       {
-       "line": 65,
+       "line": 69,
        "code": "try:",
        "text": "Вся операция хода использует один rollback boundary."
       },
       {
-       "line": 66,
+       "line": 70,
        "code": "game = await self._require_active_game_for_update(cmd.game_id)",
        "text": "Row lock не дает двум ходам одновременно строиться из одной позиции."
       },
       {
-       "line": 76,
+       "line": 80,
        "code": "existing_moves = await self._repo.get_moves(cmd.game_id)",
        "text": "История читается после lock, поэтому move_number строится из сериализованного state."
       },
       {
-       "line": 77,
+       "line": 81,
        "code": "move_entity = apply_player_move(",
        "text": "Domain transition меняет FEN, часы и возможный outcome только в памяти."
       },
       {
-       "line": 85,
+       "line": 89,
        "code": "move_entity = await self._repo.add_move(move_entity)",
        "text": "Строка хода ставится в сессию без отдельного commit."
       },
       {
-       "line": 86,
+       "line": 90,
        "code": "game = await self._persist_and_commit(game)",
        "text": "Game update и move row становятся видимыми одним commit внутри service boundary."
       },
       {
-       "line": 87,
+       "line": 91,
        "code": "except Exception:",
        "text": "Любая ошибка после staging переходит в общий rollback path."
       },
       {
-       "line": 88,
+       "line": 92,
        "code": "await self._repo.rollback()",
        "text": "Rollback снимает обе незакоммиченные записи."
       },
       {
-       "line": 90,
+       "line": 94,
        "code": "return game, move_entity",
        "text": "WebSocket получает результат только после успешного commit."
       }
@@ -1753,8 +1753,8 @@
    "code": "disconnected_game = await service.mark_disconnected(UUID(user_id))"
   },
   {
-   "ref": "backend/tests/test_game_domain_rules.py:85",
-   "code": "assert snapshot.active_color == \"white\""
+   "ref": "backend/tests/test_game_domain_rules.py:95",
+   "code": "def test_pause_for_disconnect_freezes_clock_and_marks_grace_deadline():"
   },
   {
    "ref": "backend/tests/test_ws_manager.py:94",
@@ -1765,16 +1765,12 @@
    "code": "uci = envelope.payload.get(\"uci\", \"\")"
   },
   {
-   "ref": "backend/domains/game/application/services.py:68",
+   "ref": "backend/domains/game/application/services.py:72",
    "code": "now = utc_now()"
   },
   {
    "ref": "backend/domains/game/domain/clock.py:55",
    "code": "def capture_clock_snapshot(game: Game, now: datetime) -> ClockSnapshot:"
-  },
-  {
-   "ref": "backend/tests/test_phase2_game_clocks.py:162",
-   "code": "assert finished_games[0].status == \"timeout\""
   },
   {
    "ref": "backend/shared/ws_manager.py:148",
@@ -1861,7 +1857,7 @@
    "code": "async def test_game_monitor_lock_is_exclusive_and_token_released():"
   },
   {
-   "ref": "backend/domains/game/application/services.py:36",
+   "ref": "backend/domains/game/application/services.py:40",
    "code": "def utc_now() -> datetime:"
   },
   {
@@ -1869,8 +1865,8 @@
    "code": "elapsed_ms = max(0, int((now - game.last_clock_started_at).total_seconds() * 1000))"
   },
   {
-   "ref": "backend/tests/test_game_domain_rules.py:66",
-   "code": "return None"
+   "ref": "backend/tests/test_game_domain_rules.py:76",
+   "code": "def test_capture_clock_snapshot_reports_running_white_clock():"
   },
   {
    "ref": "backend/domains/game/domain/clock.py:13",
@@ -1881,7 +1877,7 @@
    "code": "\"clock\": current_clock_snapshot(game),"
   },
   {
-   "ref": "backend/tests/test_service_and_serializer_coverage.py:474",
+   "ref": "backend/tests/test_service_and_serializer_coverage.py:480",
    "code": "def test_game_clock_moves_and_lifecycle_edges():"
   },
   {
@@ -1889,19 +1885,11 @@
    "code": "DEFAULT_DISCONNECT_GRACE_SECONDS = 20"
   },
   {
-   "ref": "backend/tests/test_phase2_game_clocks.py:56",
-   "code": ""
-  },
-  {
-   "ref": "backend/tests/test_phase2_game_clocks.py:127",
-   "code": "assert finished_games[0].status == \"aborted\""
-  },
-  {
-   "ref": "backend/domains/game/application/services.py:76",
+   "ref": "backend/domains/game/application/services.py:80",
    "code": "existing_moves = await self._repo.get_moves(cmd.game_id)"
   },
   {
-   "ref": "backend/domains/game/application/services.py:85",
+   "ref": "backend/domains/game/application/services.py:89",
    "code": "move_entity = await self._repo.add_move(move_entity)"
   },
   {
@@ -1921,8 +1909,8 @@
    "code": "def _board_with_history(game: Game, previous_moves: Sequence[Move]) -> chess.Board:"
   },
   {
-   "ref": "backend/tests/test_game_domain_rules.py:172",
-   "code": "assert finished_game.status == GameStatus.DRAW"
+   "ref": "backend/tests/test_game_domain_rules.py:182",
+   "code": "async def test_replay_divergence_falls_back_to_authoritative_fen(monkeypatch):"
   },
   {
    "ref": "backend/domains/game/infrastructure/repository.py:82",
@@ -1937,8 +1925,8 @@
    "code": "def upgrade() -> None:"
   },
   {
-   "ref": "backend/tests/test_database_bootstrap.py:117",
-   "code": ""
+   "ref": "backend/tests/test_database_bootstrap.py:235",
+   "code": "def test_games_by_player_indexes_are_declared_in_migrations():"
   },
   {
    "ref": "backend/alembic/env.py:28",
@@ -1949,11 +1937,11 @@
    "code": "def upgrade() -> None:"
   },
   {
-   "ref": "backend/tests/test_database_bootstrap.py:19",
+   "ref": "backend/tests/test_database_bootstrap.py:25",
    "code": "async def test_initialize_database_runs_migrations_before_seeding(monkeypatch):"
   },
   {
-   "ref": "backend/tests/test_database_bootstrap.py:53",
+   "ref": "backend/tests/test_database_bootstrap.py:59",
    "code": "def test_to_migration_database_url_rewrites_asyncpg_for_alembic():"
   },
   {
@@ -1973,7 +1961,7 @@
    "code": "token = websocket.query_params.get(\"token\")"
   },
   {
-   "ref": "backend/tests/test_service_and_serializer_coverage.py:426",
+   "ref": "backend/tests/test_service_and_serializer_coverage.py:432",
    "code": "async def test_security_tokens_and_current_user_dependency(monkeypatch):"
   },
   {
@@ -1989,19 +1977,19 @@
    "code": "async def test_game_ws_move_validates_game_id_and_broadcasts_state(monkeypatch):"
   },
   {
-   "ref": "backend/domains/game/application/services.py:185",
+   "ref": "backend/domains/game/application/services.py:189",
    "code": "async def mark_disconnected(self, user_id: UUID) -> Game | None:"
   },
   {
-   "ref": "backend/domains/game/application/services.py:248",
-   "code": "if game.disconnect_grace_deadline_at is not None and game.disconnect_grace_deadline_at <= now:"
+   "ref": "backend/domains/game/application/services.py:253",
+   "code": "async def _monitor_locked_game(self, game: Game, now: datetime) -> Game | None:"
   },
   {
-   "ref": "backend/domains/game/application/services.py:86",
+   "ref": "backend/domains/game/application/services.py:90",
    "code": "game = await self._persist_and_commit(game)"
   },
   {
-   "ref": "backend/tests/test_game_repository_transactions.py:198",
+   "ref": "backend/tests/test_game_repository_transactions.py:202",
    "code": "async def test_make_move_rolls_back_move_when_game_update_fails(monkeypatch):"
   },
   {
@@ -2055,6 +2043,18 @@
   {
    "ref": ".github/workflows/pr-ci.yml:232",
    "code": "- name: Run desktop E2E tests"
+  },
+  {
+   "ref": "backend/tests/test_phase2_game_clocks.py:441",
+   "code": "async def test_clock_timeout_triggers_when_active_player_flags(monkeypatch):"
+  },
+  {
+   "ref": "backend/tests/test_phase2_game_clocks.py:113",
+   "code": "async def test_disconnect_grace_auto_aborts_game_before_meaningful_start(monkeypatch):"
+  },
+  {
+   "ref": "backend/tests/test_phase2_game_clocks.py:143",
+   "code": "async def test_disconnect_grace_times_out_meaningfully_started_game(monkeypatch):"
   }
  ]
 }

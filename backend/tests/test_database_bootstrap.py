@@ -1,9 +1,15 @@
+from types import SimpleNamespace
+
 import pytest
 from app.config import Settings
 
 from domains.admin.infrastructure import seed as admin_seed
 from infrastructure.database_bootstrap import initialize_database
-from infrastructure.database_migrations import ALEMBIC_SCRIPT_PATH, HEAD_REVISION, to_migration_database_url
+from infrastructure.database_migrations import (
+    ALEMBIC_SCRIPT_PATH,
+    HEAD_REVISION,
+    to_migration_database_url,
+)
 
 
 MAX_ALEMBIC_VERSION_LENGTH = 32
@@ -274,3 +280,133 @@ def test_game_state_integrity_migration_declares_columns_and_constraints():
     duplicate_guard_sql = str(recorder.connection.executed[0]).lower()
     assert "group by" in duplicate_guard_sql
     assert "having" in duplicate_guard_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_email", "existing_username", "query_matches"),
+    [
+        ("admin@chessview.app", "player", [True]),
+        ("player@example.com", "admin", [False, True]),
+    ],
+)
+async def test_seed_first_admin_does_not_promote_existing_non_admin_collisions(
+    monkeypatch,
+    existing_email,
+    existing_username,
+    query_matches,
+):
+    existing_user = SimpleNamespace(
+        email=existing_email,
+        username=existing_username,
+        password="existing-hash",
+        role="user",
+        banned_at=None,
+    )
+    query_results = [existing_user if matched else None for matched in query_matches]
+    added_users = []
+    commits = []
+
+    class FakeResult:
+        def __init__(self, user):
+            self.user = user
+
+        def scalar_one_or_none(self):
+            return self.user
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, _statement):
+            return FakeResult(query_results.pop(0) if query_results else None)
+
+        def add(self, user):
+            added_users.append(user)
+
+        async def commit(self):
+            commits.append("commit")
+
+    def fake_sessionmaker(_engine, expire_on_commit=False):
+        assert expire_on_commit is False
+        return lambda: FakeSession()
+
+    monkeypatch.setattr(admin_seed, "async_sessionmaker", fake_sessionmaker)
+    monkeypatch.setattr(admin_seed.settings, "FIRST_ADMIN_EMAIL", None)
+    monkeypatch.setattr(admin_seed.settings, "SEED_ADMIN_EMAIL", "admin@chessview.app")
+    monkeypatch.setattr(admin_seed.settings, "SEED_ADMIN_USERNAME", "admin")
+    monkeypatch.setattr(admin_seed.settings, "SEED_ADMIN_PASSWORD", "admin123")
+
+    await admin_seed.seed_first_admin(object())
+
+    assert existing_user.email == existing_email
+    assert existing_user.username == existing_username
+    assert existing_user.password == "existing-hash"
+    assert existing_user.role == "user"
+    assert added_users == []
+    assert commits == []
+
+@pytest.mark.asyncio
+async def test_seed_first_admin_preserves_existing_admin_password(monkeypatch):
+    existing_admin = SimpleNamespace(
+        email="admin@chessview.app",
+        username="admin",
+        password="existing-hash",
+        role="admin",
+        banned_at=None,
+    )
+    commits = []
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return existing_admin
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def execute(self, _statement):
+            return FakeResult()
+
+        async def commit(self):
+            commits.append("commit")
+
+    def fake_sessionmaker(_engine, expire_on_commit=False):
+        assert expire_on_commit is False
+        return lambda: FakeSession()
+
+    def fail_hash(_password):
+        raise AssertionError("existing admin seed password must not be re-hashed")
+
+    monkeypatch.setattr(admin_seed, "async_sessionmaker", fake_sessionmaker)
+    monkeypatch.setattr(admin_seed.settings, "FIRST_ADMIN_EMAIL", None)
+    monkeypatch.setattr(admin_seed.settings, "SEED_ADMIN_EMAIL", "admin@chessview.app")
+    monkeypatch.setattr(admin_seed.settings, "SEED_ADMIN_USERNAME", "admin")
+    monkeypatch.setattr(admin_seed.settings, "SEED_ADMIN_PASSWORD", "admin123")
+    monkeypatch.setattr(admin_seed, "hash_password", fail_hash)
+
+    await admin_seed.seed_first_admin(object())
+
+    assert existing_admin.password == "existing-hash"
+    assert existing_admin.role == "admin"
+    assert commits == []
+
+def test_game_state_integrity_migration_duplicate_moves_abort_before_unique_constraint():
+    recorder = _AlembicOpRecorder(first_result=("game-id", 1))
+    migration_file = (
+        ALEMBIC_SCRIPT_PATH / "versions" / f"{GAME_STATE_INTEGRITY_REVISION}.py"
+    )
+    namespace: dict[str, object] = {}
+    exec(migration_file.read_text(encoding="utf-8"), namespace)
+    namespace["op"] = recorder
+
+    with pytest.raises(RuntimeError, match="duplicate move numbers"):
+        namespace["upgrade"]()
+
+    assert ("moves", "uq_moves_game_move_number") not in recorder.unique_constraints

@@ -14,7 +14,11 @@ from domains.game.application.commands import (
 )
 from domains.game.domain.entities import Game, Move
 from domains.game.domain.exceptions import GameAccessDenied, GameNotActive, GameNotFound
-from domains.game.domain.clock import active_player_id, active_remaining_time_ms, capture_clock_snapshot
+from domains.game.domain.clock import (
+    active_player_id,
+    active_remaining_time_ms,
+    capture_clock_snapshot,
+)
 from domains.game.domain.moves import apply_player_move
 from domains.game.domain.outcomes import (
     abort_game,
@@ -28,7 +32,7 @@ from domains.game.domain.outcomes import (
     set_disconnect_grace_remaining_ms,
     timeout_game,
 )
-from domains.game.domain.policies import DEFAULT_DISCONNECT_GRACE_SECONDS, is_meaningfully_started
+from domains.game.domain.policies import is_meaningfully_started
 from domains.game.domain.repository import AbstractGameRepository
 from domains.game.domain.value_objects import GameStatus
 
@@ -228,6 +232,8 @@ class GameService:
         now = utc_now()
         updated_games: list[Game] = []
         for candidate in await self._repo.list_active():
+            if not self._monitor_due(candidate, now):
+                continue
             try:
                 game = await self._repo.get_by_id_for_update(candidate.id)
                 if game is None or game.status != GameStatus.ACTIVE:
@@ -274,16 +280,20 @@ class GameService:
         disconnected_player_id = game.disconnected_player_id or active_player_id(game)
         return await self._finalize_disconnect_expiration_for_player(game, disconnected_player_id, now)
 
-    async def _finalize_disconnect_expiration_for_player(self, game: Game, disconnected_player_id: UUID | None, now: datetime) -> Game:
+    async def _finalize_disconnect_expiration_for_player(
+        self, game: Game, disconnected_player_id: UUID | None, now: datetime
+    ) -> Game:
         if disconnected_player_id is not None:
             set_disconnect_grace_remaining_ms(game, disconnected_player_id, 0)
 
-        move_count = len(await self._repo.get_moves(game.id))
-        if is_meaningfully_started(move_count):
+        move_counts = await self._repo.get_move_counts([game.id])
+        if is_meaningfully_started(move_counts.get(game.id, 0)):
             if disconnected_player_id is None:
                 disconnected_player_id = active_player_id(game)
             if disconnected_player_id is not None:
-                return await self._finalize_timeout(game, disconnected_player_id, now, "disconnect_timeout")
+                return await self._finalize_timeout(
+                    game, disconnected_player_id, now, "disconnect_timeout"
+                )
         return await self._finalize_abort(game, now, "auto_abort")
 
     async def _finalize_timeout(self, game: Game, losing_player_id: UUID, now: datetime, reason: str) -> Game:
@@ -331,3 +341,11 @@ class GameService:
         if user_id == game.black_id:
             return game.black_disconnect_grace_remaining_ms
         raise GameAccessDenied()
+
+
+    @staticmethod
+    def _monitor_due(game: Game, now: datetime) -> bool:
+        return (
+            game.disconnect_grace_deadline_at is not None
+            and game.disconnect_grace_deadline_at <= now
+        ) or active_remaining_time_ms(game, now) <= 0

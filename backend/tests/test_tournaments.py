@@ -7,6 +7,8 @@ from domains.game.domain.entities import Game
 from domains.game.domain.value_objects import GameResult, GameStatus
 from domains.tournaments.application.services import TournamentService
 from domains.tournaments.domain.value_objects import TournamentStatus
+from domains.tournaments.infrastructure.models import TournamentModel
+from domains.tournaments.infrastructure.repository import SqlAlchemyTournamentRepository
 
 
 class InMemoryTournamentRepository:
@@ -17,7 +19,7 @@ class InMemoryTournamentRepository:
         self.pairings = {}
         self.next_round_id = 1
         self.next_pairing_id = 1
-        self.confirmed_entry_payments = set()
+        self.confirmed_entry_payments = {}
 
     async def create_tournament(self, tournament):
         self.tournaments[tournament.id] = tournament
@@ -85,8 +87,15 @@ class InMemoryTournamentRepository:
     async def update_pairing(self, pairing):
         return pairing
 
-    async def has_confirmed_entry_payment(self, tournament_id, user_id):
-        return (tournament_id, user_id) in self.confirmed_entry_payments
+    async def has_confirmed_entry_payment(
+        self, tournament_id, user_id, minimum_amount_cents=0
+    ):
+        amount_cents = self.confirmed_entry_payments.get((tournament_id, user_id))
+        return amount_cents is not None and amount_cents >= minimum_amount_cents
+
+
+    async def get_tournament_for_update(self, tournament_id):
+        return self.tournaments.get(tournament_id)
 
 
 class StubUser:
@@ -236,13 +245,15 @@ async def test_paid_tournament_requires_confirmed_entry_payment():
     game_service = StubGameService(game_repo)
     service = TournamentService(tournament_repo, user_repo, game_repo, game_service)
 
-    tournament = await service.create_tournament(owner.id, "Paid Swiss", "5+0", entry_fee_cents=250)
+    tournament = await service.create_tournament(
+        owner.id, "Paid Swiss", "5+0", entry_fee_cents=250
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         await service.join_tournament(tournament.id, guest.id)
     assert exc_info.value.status_code == 402
 
-    tournament_repo.confirmed_entry_payments.add((tournament.id, guest.id))
+    tournament_repo.confirmed_entry_payments[(tournament.id, guest.id)] = 250
     await service.join_tournament(tournament.id, guest.id)
 
     assert await tournament_repo.get_player(tournament.id, guest.id) is not None
@@ -359,3 +370,70 @@ async def test_sync_game_result_advances_round_without_immediate_rematch():
     assert updated_tournament is not None
     assert updated_tournament.current_round == 2
     assert round_two_matchups.isdisjoint(round_one_matchups)
+
+
+@pytest.mark.asyncio
+async def test_paid_tournament_rejects_underpriced_confirmed_payment_and_accepts_current_fee():
+    owner = StubUser(uuid4(), "owner", 1500)
+    guest = StubUser(uuid4(), "guest", 1480)
+    tournament_repo = InMemoryTournamentRepository()
+    user_repo = InMemoryUserRepository([owner, guest])
+    game_repo = InMemoryGameRepository()
+    game_service = StubGameService(game_repo)
+    service = TournamentService(tournament_repo, user_repo, game_repo, game_service)
+
+    tournament = await service.create_tournament(
+        owner.id, "Repriced Swiss", "5+0", entry_fee_cents=500
+    )
+    tournament_repo.confirmed_entry_payments[(tournament.id, guest.id)] = 250
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.join_tournament(tournament.id, guest.id)
+
+    assert exc_info.value.status_code == 402
+    assert await tournament_repo.get_player(tournament.id, guest.id) is None
+
+    tournament_repo.confirmed_entry_payments[(tournament.id, guest.id)] = 500
+    await service.join_tournament(tournament.id, guest.id)
+
+    assert await tournament_repo.get_player(tournament.id, guest.id) is not None
+
+@pytest.mark.asyncio
+async def test_otb_looking_email_without_otb_password_marker_remains_rated():
+    owner = StubUser(uuid4(), "owner", 1500)
+    guest = StubUser(uuid4(), "guest", 1480)
+    guest.email = "guest@otb.chessview.local"
+    guest.password_hash = "hash"
+    tournament_repo = InMemoryTournamentRepository()
+    user_repo = InMemoryUserRepository([owner, guest])
+    game_repo = InMemoryGameRepository()
+    game_service = StubGameService(game_repo)
+    service = TournamentService(tournament_repo, user_repo, game_repo, game_service)
+
+    tournament = await service.create_tournament(owner.id, "Rated Swiss", "5+0")
+    await service.join_tournament(tournament.id, guest.id)
+    await service.start_tournament(tournament.id, owner.id)
+
+    created_game = next(iter(game_repo.games.values()))
+    assert created_game.rated is True
+
+@pytest.mark.asyncio
+async def test_tournament_update_lookup_locks_current_fee_row():
+    tournament_id = uuid4()
+    model = object()
+
+    class LockTrackingSession:
+        def __init__(self):
+            self.get_calls = []
+
+        async def get(self, entity, key, **kwargs):
+            self.get_calls.append((entity, key, kwargs))
+            return model
+
+    session = LockTrackingSession()
+    repo = SqlAlchemyTournamentRepository(session)
+
+    assert await repo._get_tournament_model(tournament_id) is model
+    assert session.get_calls == [
+        (TournamentModel, tournament_id, {"with_for_update": True})
+    ]

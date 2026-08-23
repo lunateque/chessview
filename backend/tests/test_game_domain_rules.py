@@ -4,7 +4,11 @@ from uuid import uuid4
 import chess
 import pytest
 
-from domains.game.application.commands import AcceptDrawCommand, MakeMoveCommand
+from domains.game.application.commands import (
+    AcceptDrawCommand,
+    DeclineDrawCommand,
+    MakeMoveCommand,
+)
 from domains.game.application.services import GameService
 from domains.game.domain.exceptions import DrawOfferNotAcceptable
 from domains.game.domain.clock import capture_clock_snapshot
@@ -289,3 +293,32 @@ async def test_legal_move_clears_pending_draw_offer(monkeypatch):
     assert updated_game.status == GameStatus.ACTIVE
     assert updated_game.pending_draw_offer_by_user_id is None
     assert updated_game.pending_draw_offer_at is None
+
+
+@pytest.mark.asyncio
+async def test_decline_draw_rejects_offerer_declining_own_pending_offer(monkeypatch):
+    white_id = uuid4()
+    black_id = uuid4()
+    offered_at = datetime(2026, 4, 14, 12, 7, tzinfo=timezone.utc)
+    repo = InMemoryGameRepository()
+    service = GameService(repo)
+    game = Game(
+        white_id=white_id,
+        black_id=black_id,
+        last_clock_started_at=offered_at,
+        started_at=offered_at,
+    )
+    game.pending_draw_offer_by_user_id = white_id
+    game.pending_draw_offer_at = offered_at
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: offered_at)
+    with pytest.raises(DrawOfferNotAcceptable):
+        await service.decline_draw(
+            DeclineDrawCommand(game_id=game.id, user_id=white_id)
+        )
+
+    assert game.status == GameStatus.ACTIVE
+    assert game.result is None
+    assert game.pending_draw_offer_by_user_id == white_id
+    assert game.pending_draw_offer_at == offered_at

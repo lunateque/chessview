@@ -10,7 +10,10 @@ from domains.identity.infrastructure.models import UserModel
 from domains.payments.infrastructure.models import PaymentEventModel, PaymentIntentModel
 from domains.payments.presentation.schemas import PaymentIntentResponse
 from domains.scheduled_matches.infrastructure.models import ScheduledMatchModel
-from domains.tournaments.infrastructure.models import TournamentModel, TournamentPlayerModel
+from domains.tournaments.infrastructure.models import (
+    TournamentModel,
+    TournamentPlayerModel,
+)
 
 
 TERMINAL_RELEASE_STATUSES = {"failed", "cancelled", "expired"}
@@ -138,15 +141,56 @@ class PaymentService:
         return payment
 
     async def simulate(self, payment_id: UUID, scenario: str) -> PaymentIntentModel:
-        payment = await self._session.get(PaymentIntentModel, payment_id)
+        payment = await self._session.get(
+            PaymentIntentModel, payment_id, with_for_update=True
+        )
         if payment is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found"
+            )
         if scenario not in SUCCESS_SCENARIOS:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported payment scenario")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported payment scenario",
+            )
         if payment.status in TERMINAL_PAYMENT_STATUSES and not (
             payment.status == "succeeded" and scenario == "refunded"
         ):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Payment is already terminal")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Payment is already terminal",
+            )
+
+        tournament = None
+        if scenario == "success" and payment.tournament_id is not None:
+            tournament = await self._session.get(
+                TournamentModel,
+                payment.tournament_id,
+                with_for_update=True,
+            )
+            if tournament is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found"
+                )
+            if tournament.status not in {"registration", "registration_open"}:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tournament registration is closed",
+                )
+            if payment.amount_cents != tournament.entry_fee_cents:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tournament entry fee changed; create a new payment",
+                )
+            existing = await self._session.get(
+                TournamentPlayerModel,
+                (payment.tournament_id, payment.user_id),
+            )
+            if existing is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Tournament entry is already registered",
+                )
 
         payment.scenario = scenario
         payment.status = SUCCESS_SCENARIOS[scenario]
@@ -156,7 +200,9 @@ class PaymentService:
         if payment.status == "succeeded":
             user = await self._session.get(UserModel, payment.user_id)
             if user is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+                )
             apply_wallet_charge(user, payment)
             subject, _subject_id = payment_subject(payment)
             if subject == "tournament":
@@ -169,7 +215,9 @@ class PaymentService:
             if user is not None:
                 apply_wallet_refund(user, payment)
             if payment.tournament_id is not None:
-                existing = await self._session.get(TournamentPlayerModel, (payment.tournament_id, payment.user_id))
+                existing = await self._session.get(
+                    TournamentPlayerModel, (payment.tournament_id, payment.user_id)
+                )
                 apply_refund_to_registration(existing, payment.updated_at)
         elif payment.status in TERMINAL_RELEASE_STATUSES:
             payment.reserved_until = None
@@ -180,20 +228,24 @@ class PaymentService:
 
     async def _confirm_registration(self, payment: PaymentIntentModel) -> None:
         if payment.tournament_id is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payment is not for a tournament")
-        existing = await self._session.get(TournamentPlayerModel, (payment.tournament_id, payment.user_id))
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payment is not for a tournament",
+            )
+        existing = await self._session.get(
+            TournamentPlayerModel, (payment.tournament_id, payment.user_id)
+        )
         if existing is not None:
-            existing.status = "active"
-            existing.withdrawn_at = None
-            return
-
-        tournament = await self._session.get(TournamentModel, payment.tournament_id)
-        if tournament is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tournament not found")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Tournament entry is already registered",
+            )
 
         user = await self._session.get(UserModel, payment.user_id)
         if user is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+            )
 
         self._session.add(
             TournamentPlayerModel(

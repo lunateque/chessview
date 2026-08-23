@@ -6,8 +6,11 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.exc import IntegrityError
 
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/chessview")
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/chessview"
+)
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("STORAGE_DIR", "storage")
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "true")
@@ -21,6 +24,7 @@ os.environ.setdefault("FRONTEND_URL", "http://localhost:5173")
 from domains.game.application.commands import MakeMoveCommand
 from domains.game.application.services import GameService
 from domains.game.domain.entities import Game, Move
+from domains.game.domain.exceptions import ConcurrentMoveConflict
 from domains.game.domain.policies import DEFAULT_GAME_START_FEN
 from domains.game.domain.value_objects import GameStatus
 from domains.game.infrastructure.models import GameModel, MoveModel
@@ -292,3 +296,55 @@ async def test_simultaneous_moves_from_same_position_serialize_to_one_commit(mon
     assert len(successful_moves) == 1
     assert store.commits == 1
     assert [move.move_number for move in store.moves] == [1]
+
+
+class _MoveInsertOrig:
+    def __init__(self, constraint_name: str) -> None:
+        self.constraint_name = constraint_name
+
+class _MoveInsertIntegritySession:
+    def __init__(self, constraint_name: str) -> None:
+        self.orig = _MoveInsertOrig(constraint_name)
+        self.added: list[object] = []
+        self.rollbacks = 0
+
+    def add(self, model: object) -> None:
+        self.added.append(model)
+
+    async def flush(self) -> None:
+        raise IntegrityError("insert into moves", {}, self.orig)
+
+    async def refresh(self, _model: object) -> None:
+        raise AssertionError("failed move inserts are not refreshed")
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+@pytest.mark.asyncio
+async def test_add_move_maps_named_unique_violation_to_concurrent_move_conflict():
+    session = _MoveInsertIntegritySession("uq_moves_game_move_number")
+    repo = SqlAlchemyGameRepository(session)
+    move = Move(
+        game_id=uuid4(), user_id=uuid4(), uci="e2e4", fen_after="fen", move_number=1
+    )
+
+    with pytest.raises(ConcurrentMoveConflict) as exc_info:
+        await repo.add_move(move)
+
+    assert isinstance(exc_info.value.__cause__, IntegrityError)
+    assert exc_info.value.__cause__.orig is session.orig
+    assert session.rollbacks == 1
+
+@pytest.mark.asyncio
+async def test_add_move_leaves_unrelated_integrity_error_unchanged():
+    session = _MoveInsertIntegritySession("uq_moves_unrelated")
+    repo = SqlAlchemyGameRepository(session)
+    move = Move(
+        game_id=uuid4(), user_id=uuid4(), uci="e2e4", fen_after="fen", move_number=1
+    )
+
+    with pytest.raises(IntegrityError) as exc_info:
+        await repo.add_move(move)
+
+    assert exc_info.value.orig is session.orig
+    assert session.rollbacks == 0

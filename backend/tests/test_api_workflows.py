@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from domains.identity.domain.exceptions import (
 )
 from domains.identity.infrastructure.models import UserModel
 from domains.payments.infrastructure.models import PaymentIntentModel
+from domains.payments.presentation import router as payments_router
 from domains.identity.presentation import router as identity_router
 from domains.profiles.presentation import router as profiles_router
 from domains.puzzles.application.services import PuzzleOverview
@@ -27,8 +29,13 @@ from domains.puzzles.domain.entities import Puzzle, PuzzleAttemptState
 from domains.puzzles.domain.exceptions import PuzzleNotFound
 from domains.puzzles.domain.value_objects import PuzzleAttemptResult
 from domains.puzzles.presentation import router as puzzles_router
-from domains.tournaments.infrastructure.models import TournamentPlayerModel
+from domains.tournaments.infrastructure.models import (
+    TournamentModel,
+    TournamentPlayerModel,
+)
+from infrastructure.redis import close_redis, get_redis_client, init_redis
 from tests.support.api import MemorySession, app_with_router
+from shared import rate_limit
 
 
 def _user_payload(user_id: UUID) -> SimpleNamespace:
@@ -588,3 +595,177 @@ def test_admin_router_refund_endpoint_audits_payment_refunds():
     audit = next(item for item in session.added if isinstance(item, AdminAuditLogModel))
     assert audit.action == "payment.refund"
     assert audit.target_id == str(payment_id)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_check_uses_atomic_fixed_window_eval(monkeypatch):
+    bucket = "identity"
+    identity = "203.0.113.10"
+    key = f"rl:{bucket}:{identity}"
+    limit = 3
+    window_s = 60
+
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.counts = {}
+            self.expires_at_ms = {}
+            self.eval_calls = []
+            self.now_ms = 1_000
+
+        async def eval(self, script, numkeys, *args):
+            self.eval_calls.append((script, numkeys, args))
+            assert numkeys == 1
+            assert len(args) == 3
+            redis_key, limit_arg, window_arg = args
+            assert redis_key == key
+            assert int(limit_arg) == limit
+            assert int(window_arg) == window_s
+            assert isinstance(script, str)
+            stored_expiry = self.expires_at_ms.get(key)
+            if stored_expiry is not None and self.now_ms >= stored_expiry:
+                self.counts.pop(key, None)
+                self.expires_at_ms.pop(key, None)
+
+            count = self.counts.get(key, 0) + 1
+            self.counts[key] = count
+            if count == 1 or key not in self.expires_at_ms:
+                self.expires_at_ms[key] = self.now_ms + (window_s * 1_000)
+            return 1 if count <= limit else 0
+
+        async def incr(self, _key):
+            raise AssertionError("rate limit checks must use Redis eval, not incr")
+
+        async def expire(self, _key, _window_s):
+            raise AssertionError("rate limit checks must use Redis eval, not expire")
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(rate_limit, "get_redis_client", lambda: fake_redis)
+
+    allowed = [
+        await rate_limit.check(bucket, identity, limit, window_s)
+        for _ in range(limit + 1)
+    ]
+
+    assert allowed == [True, True, True, False]
+    assert len(fake_redis.eval_calls) == limit + 1
+    assert fake_redis.counts[key] == limit + 1
+    assert fake_redis.expires_at_ms[key] == fake_redis.now_ms + (window_s * 1_000)
+
+    fake_redis.counts[key] = limit + 4
+    fake_redis.expires_at_ms.pop(key)
+    assert await rate_limit.check(bucket, identity, limit, window_s) is False
+    assert fake_redis.expires_at_ms[key] == fake_redis.now_ms + (window_s * 1_000)
+
+@pytest.mark.asyncio
+async def test_rate_limit_fixed_window_is_atomic_in_redis():
+    await init_redis()
+    client = get_redis_client()
+    bucket = f"test-{uuid4()}"
+    identity = "concurrent"
+    key = f"rl:{bucket}:{identity}"
+    stale_identity = "stale-no-ttl"
+    stale_key = f"rl:{bucket}:{stale_identity}"
+    limit = 3
+    window_s = 10
+    try:
+        await client.delete(key, stale_key)
+        results = await asyncio.gather(
+            *(rate_limit.check(bucket, identity, limit, window_s) for _ in range(20))
+        )
+
+        assert sum(results) == limit
+        assert int(await client.get(key)) == 20
+        assert 0 < await client.ttl(key) <= window_s
+
+        await client.set(stale_key, limit + 4)
+        assert await client.ttl(stale_key) == -1
+        assert await rate_limit.check(bucket, stale_identity, limit, window_s) is False
+        assert 0 < await client.ttl(stale_key) <= window_s
+    finally:
+        await client.delete(key, stale_key)
+        await close_redis()
+
+def test_public_payment_emulator_accepts_user_scenarios_and_rejects_refunded_or_disputed():
+    user_id = uuid4()
+    tournament_id = uuid4()
+    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    session = MemorySession()
+    user = UserModel(
+        id=user_id,
+        username="payer",
+        email="payer@example.com",
+        password="hashed",
+        rating=1500,
+        coins=10_000,
+        role="user",
+        banned_at=None,
+        created_at=now,
+    )
+    tournament = TournamentModel(
+        id=tournament_id,
+        owner_id=uuid4(),
+        name="Paid Open",
+        time_control_name="5+0",
+        entry_fee_cents=100,
+        status="registration",
+        current_round=0,
+        total_rounds=3,
+        created_at=now,
+    )
+    session.store[(UserModel, user_id)] = user
+    session.store[(TournamentModel, tournament_id)] = tournament
+
+    client = TestClient(
+        app_with_router(
+            payments_router.router,
+            prefix="/api/v1/payments",
+            session=session,
+            user_id=str(user_id),
+        )
+    )
+
+    def store_payment():
+        payment_id = uuid4()
+        payment = PaymentIntentModel(
+            id=payment_id,
+            user_id=user_id,
+            tournament_id=tournament_id,
+            scheduled_match_id=None,
+            amount_cents=100,
+            currency="CVC",
+            status="created",
+            scenario=None,
+            reserved_until=now,
+            metadata_json={"wallet_currency": "ChessView coins"},
+            created_at=now,
+            updated_at=now,
+        )
+        session.store[(PaymentIntentModel, payment_id)] = payment
+        return payment
+
+    expected_statuses = {
+        "success": "succeeded",
+        "failed": "failed",
+        "pending": "pending",
+        "cancelled": "cancelled",
+        "expired": "expired",
+    }
+    for scenario, expected_status in expected_statuses.items():
+        payment = store_payment()
+        response = client.post(
+            f"/api/v1/payments/emulator/{payment.id}/simulate",
+            json={"scenario": scenario},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == expected_status
+
+    for scenario in ("refunded", "disputed"):
+        payment = store_payment()
+        response = client.post(
+            f"/api/v1/payments/emulator/{payment.id}/simulate",
+            json={"scenario": scenario},
+        )
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert payment.status == "created"

@@ -10,7 +10,11 @@ from fastapi.security import HTTPAuthorizationCredentials
 from app.dependencies import get_current_user_id
 from domains.communication.application.services import ChatService, MAX_MESSAGE_LENGTH
 from domains.communication.domain.exceptions import MessageTooLong
-from domains.game.domain.clock import ClockSnapshot, active_player_id, active_remaining_time_ms
+from domains.game.domain.clock import (
+    ClockSnapshot,
+    active_player_id,
+    active_remaining_time_ms,
+)
 from domains.game.domain.entities import Game, Move
 from domains.game.domain.exceptions import IllegalMove, NotYourTurn
 from domains.game.domain.moves import apply_player_move
@@ -26,7 +30,6 @@ from domains.game.domain.outcomes import (
 )
 from domains.game.domain.value_objects import Color, GameResult, GameStatus
 from domains.game.presentation.serializers import (
-    PlayerDirectory,
     player_directory_from_users,
     rating_delta_for_user,
     rating_summary,
@@ -78,7 +81,10 @@ from domains.scheduled_matches.service import ScheduledMatchService
 from domains.shop.application import ShopService
 from domains.shop.infrastructure.models import ShopItemModel, UserShopItemModel
 from domains.tournaments.domain.entities import TournamentPairing
-from domains.tournaments.infrastructure.models import TournamentModel, TournamentPlayerModel
+from domains.tournaments.infrastructure.models import (
+    TournamentModel,
+    TournamentPlayerModel,
+)
 from domains.tournaments.presentation.serializers import (
     TournamentPlayerDirectory,
     count_games_played,
@@ -587,11 +593,16 @@ def test_game_serializers_cover_fallbacks_and_rating_summaries():
         white_rating_after=1410,
         black_rating_after=1490,
     )
+    offered_at = datetime(2026, 5, 25, 12, 1, tzinfo=timezone.utc)
+    game.pending_draw_offer_by_user_id = black_id
+    game.pending_draw_offer_at = offered_at
     users = {
         white_id: SimpleNamespace(username="White", rating=1410, avatar_path="/w.png"),
     }
     players = player_directory_from_users(users)
-    move = Move(game_id=game.id, user_id=white_id, uci="e2e4", fen_after="fen", move_number=1)
+    move = Move(
+        game_id=game.id, user_id=white_id, uci="e2e4", fen_after="fen", move_number=1
+    )
 
     assert players.detail(black_id).username == "?"
     assert players.brief(white_id).username == "White"
@@ -603,6 +614,8 @@ def test_game_serializers_cover_fallbacks_and_rating_summaries():
     list_item = to_game_list_item(game, white_id, players, move_count=1)
     assert list_item.opponent.username == "?"
     assert list_item.my_color == "white"
+    assert list_item.pending_draw_offer_by_user_id == str(black_id)
+    assert list_item.pending_draw_offer_at == offered_at
 
     detail = to_game_detail_response(
         game,
@@ -624,6 +637,8 @@ def test_game_serializers_cover_fallbacks_and_rating_summaries():
     )
     assert detail.moves[0].username == "White"
     assert detail.black.username == "?"
+    assert detail.pending_draw_offer_by_user_id == str(black_id)
+    assert detail.pending_draw_offer_at == offered_at
 
 
 def test_tournament_serializers_cover_byes_standings_and_details():
@@ -927,6 +942,7 @@ class GenericMemorySession:
         self.store: dict[object, object] = {}
         self.added: list[object] = []
         self.commits = 0
+        self.get_calls: list[tuple[object, object, dict[str, object]]] = []
 
     def add(self, item):
         if hasattr(item, "id") and getattr(item, "id", None) is None:
@@ -945,7 +961,8 @@ class GenericMemorySession:
         if key is not None:
             self.store[(type(item), key)] = item
 
-    async def get(self, model, key):
+    async def get(self, model, key, **kwargs):
+        self.get_calls.append((model, key, kwargs))
         return self.store.get((model, key))
 
     async def execute(self, _statement):
@@ -1276,3 +1293,208 @@ async def test_puzzle_and_profile_services_cover_empty_and_not_found_paths():
     assert await profile_service.search_players("   ") == []
     assert (await profile_service.search_players(" alice ", limit=1))[0].query == "alice"
     assert (await profile_service.get_top_players(limit=2))[0].limit == 2
+
+
+@pytest.mark.parametrize(
+    ("payment_amount", "current_fee"),
+    [(250, 500), (500, 250)],
+)
+@pytest.mark.asyncio
+async def test_payment_service_rejects_stale_fee_intent_before_wallet_or_registration(
+    payment_amount,
+    current_fee,
+):
+    session = GenericMemorySession()
+    service = PaymentService(session)
+    payment_id = uuid4()
+    user_id = uuid4()
+    tournament_id = uuid4()
+    now = datetime.now(timezone.utc)
+    tournament = TournamentModel(
+        id=tournament_id,
+        owner_id=uuid4(),
+        name="Repriced Open",
+        time_control_name="5+0",
+        entry_fee_cents=current_fee,
+        status="registration",
+        current_round=0,
+        total_rounds=3,
+    )
+    user = UserModel(
+        id=user_id,
+        username="payer",
+        email="payer@example.com",
+        password="hash",
+        rating=1500,
+        coins=1000,
+    )
+    payment = PaymentIntentModel(
+        id=payment_id,
+        user_id=user_id,
+        tournament_id=tournament_id,
+        scheduled_match_id=None,
+        amount_cents=payment_amount,
+        currency="CVC",
+        status="created",
+        scenario=None,
+        reserved_until=now + timedelta(minutes=15),
+        metadata_json={"wallet_currency": "ChessView coins"},
+        created_at=now,
+    )
+    session.store[(TournamentModel, tournament_id)] = tournament
+    session.store[(UserModel, user_id)] = user
+    session.store[(PaymentIntentModel, payment_id)] = payment
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.simulate(payment_id, "success")
+
+    assert exc_info.value.status_code == 409
+    assert user.coins == 1000
+    assert "wallet_debited" not in payment.metadata_json
+    assert (TournamentPlayerModel, (tournament_id, user_id)) not in session.store
+    assert (
+        TournamentModel,
+        tournament_id,
+        {"with_for_update": True},
+    ) in session.get_calls
+    assert (
+        PaymentIntentModel,
+        payment_id,
+        {"with_for_update": True},
+    ) in session.get_calls
+
+@pytest.mark.asyncio
+async def test_payment_service_rejects_non_refund_replay_after_succeeded_status():
+    session = GenericMemorySession()
+    service = PaymentService(session)
+    payment_id = uuid4()
+    user_id = uuid4()
+    tournament_id = uuid4()
+    payment = PaymentIntentModel(
+        id=payment_id,
+        user_id=user_id,
+        tournament_id=tournament_id,
+        scheduled_match_id=None,
+        amount_cents=250,
+        currency="CVC",
+        status="succeeded",
+        scenario="success",
+        reserved_until=None,
+        metadata_json={"wallet_debited": True, "wallet_amount": 250},
+        created_at=datetime.now(timezone.utc),
+    )
+    session.store[(PaymentIntentModel, payment_id)] = payment
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.simulate(payment_id, "failed")
+
+    assert exc_info.value.status_code == 409
+    assert payment.status == "succeeded"
+    assert payment.metadata_json == {"wallet_debited": True, "wallet_amount": 250}
+    assert session.commits == 0
+
+@pytest.mark.asyncio
+async def test_payment_service_rejects_tournament_success_after_registration_closes():
+    session = GenericMemorySession()
+    service = PaymentService(session)
+    payment_id = uuid4()
+    user_id = uuid4()
+    tournament_id = uuid4()
+    now = datetime.now(timezone.utc)
+    tournament = TournamentModel(
+        id=tournament_id,
+        owner_id=uuid4(),
+        name="Closed Open",
+        time_control_name="5+0",
+        entry_fee_cents=250,
+        status="active",
+        current_round=1,
+        total_rounds=3,
+    )
+    user = UserModel(
+        id=user_id,
+        username="late-payer",
+        email="late@example.com",
+        password="hash",
+        rating=1500,
+        coins=1000,
+    )
+    payment = PaymentIntentModel(
+        id=payment_id,
+        user_id=user_id,
+        tournament_id=tournament_id,
+        scheduled_match_id=None,
+        amount_cents=250,
+        currency="CVC",
+        status="created",
+        scenario=None,
+        reserved_until=now + timedelta(minutes=15),
+        metadata_json={"wallet_currency": "ChessView coins"},
+        created_at=now,
+    )
+    session.store[(TournamentModel, tournament_id)] = tournament
+    session.store[(UserModel, user_id)] = user
+    session.store[(PaymentIntentModel, payment_id)] = payment
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.simulate(payment_id, "success")
+
+    assert exc_info.value.status_code == 409
+    assert user.coins == 1000
+    assert "wallet_debited" not in payment.metadata_json
+    assert (TournamentPlayerModel, (tournament_id, user_id)) not in session.store
+
+@pytest.mark.asyncio
+async def test_payment_service_rejects_duplicate_member_intent_before_wallet_charge():
+    session = GenericMemorySession()
+    service = PaymentService(session)
+    payment_id = uuid4()
+    user_id = uuid4()
+    tournament_id = uuid4()
+    now = datetime.now(timezone.utc)
+    tournament = TournamentModel(
+        id=tournament_id,
+        owner_id=uuid4(),
+        name="Paid Open",
+        time_control_name="5+0",
+        entry_fee_cents=250,
+        status="registration",
+        current_round=0,
+        total_rounds=3,
+    )
+    user = UserModel(
+        id=user_id,
+        username="member",
+        email="member@example.com",
+        password="hash",
+        rating=1500,
+        coins=1000,
+    )
+    payment = PaymentIntentModel(
+        id=payment_id,
+        user_id=user_id,
+        tournament_id=tournament_id,
+        scheduled_match_id=None,
+        amount_cents=250,
+        currency="CVC",
+        status="created",
+        scenario=None,
+        reserved_until=now + timedelta(minutes=15),
+        metadata_json={"wallet_currency": "ChessView coins"},
+        created_at=now,
+    )
+    session.store[(TournamentModel, tournament_id)] = tournament
+    session.store[(UserModel, user_id)] = user
+    session.store[(PaymentIntentModel, payment_id)] = payment
+    session.store[(TournamentPlayerModel, (tournament_id, user_id))] = SimpleNamespace(
+        status="active",
+        withdrawn_at=None,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.simulate(payment_id, "success")
+
+    assert exc_info.value.status_code == 409
+    assert user.coins == 1000
+    assert "wallet_debited" not in payment.metadata_json
+    assert session.commits == 0

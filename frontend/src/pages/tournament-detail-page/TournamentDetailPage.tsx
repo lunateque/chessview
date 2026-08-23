@@ -93,7 +93,7 @@ export default function TournamentDetailPage() {
   });
 
   const simulateEntryPayment = useMutation({
-    mutationFn: (scenario: "success" | "failed" | "pending" | "cancelled" | "expired" | "disputed") =>
+    mutationFn: (scenario: "success" | "failed" | "pending" | "cancelled" | "expired") =>
       http.post<PaymentIntentResponse>(`/payments/emulator/${entryPayment?.id}/simulate`, { scenario }),
     onSuccess: async (payment) => {
       setEntryPayment(payment);
@@ -311,7 +311,7 @@ export default function TournamentDetailPage() {
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  {(["success", "pending", "failed", "cancelled", "expired", "disputed"] as const).map((scenario) => (
+                  {(["success", "pending", "failed", "cancelled", "expired"] as const).map((scenario) => (
                     <Button
                       key={scenario}
                       size="sm"

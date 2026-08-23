@@ -4,7 +4,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi import status
@@ -659,4 +659,65 @@ async def test_rtc_ws_requires_game_id_and_relays_signals(monkeypatch):
         (game_id, user_id, EventType.RTC_OFFER, {"sdp": "offer"}),
         (game_id, user_id, EventType.RTC_ANSWER, {"sdp": "answer"}),
         (game_id, user_id, EventType.RTC_ICE, {"candidate": "ice"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ws_disconnect_terminal_result_broadcasts_game_over(monkeypatch):
+    user_id = uuid4()
+    game = Game(white_id=user_id, black_id=uuid4())
+    game.status = "timeout"
+    game.result = "0-1"
+    game.termination_reason = "disconnect_timeout"
+    manager = RecordingManager()
+    side_effects: list[tuple[str, object]] = []
+    left_queue = []
+
+    async def restore_active_room_membership(_user_id):
+        return None
+
+    class MatchmakingService:
+        async def leave_queue(self, left_user_id):
+            left_queue.append(left_user_id)
+
+    class GameService:
+        def __init__(self, _repo) -> None:
+            pass
+
+        async def mark_disconnected(self, disconnected_user_id):
+            assert disconnected_user_id == user_id
+            return game
+
+    async def apply_ratings(game_id, _session):
+        side_effects.append(("ratings", game_id))
+
+    async def sync_tournament(game_id, _session):
+        side_effects.append(("tournament", game_id))
+
+    monkeypatch.setattr(ws_entry, "manager", manager)
+    monkeypatch.setattr(game_ws, "manager", manager)
+    monkeypatch.setattr(
+        ws_entry, "decode_token", lambda _token: {"type": "access", "sub": str(user_id)}
+    )
+    monkeypatch.setattr(
+        ws_entry, "_restore_active_room_membership", restore_active_room_membership
+    )
+    monkeypatch.setattr(ws_entry, "async_session_factory", fake_session_factory)
+    monkeypatch.setattr(ws_entry, "GameService", GameService)
+    monkeypatch.setattr(ws_entry, "SqlAlchemyGameRepository", lambda _session: object())
+    monkeypatch.setattr(
+        "domains.matchmaking.application.services.MatchmakingService",
+        MatchmakingService,
+    )
+    monkeypatch.setattr(game_ws, "_apply_ratings_if_needed", apply_ratings)
+    monkeypatch.setattr(game_ws, "_sync_tournament_if_needed", sync_tournament)
+
+    websocket = FakeWebSocket(token="good")
+    await ws_entry.ws_endpoint(websocket)  # type: ignore[arg-type]
+
+    assert left_queue == [user_id]
+    assert manager.disconnected == [(str(user_id), websocket)]
+    assert side_effects == [("ratings", game.id), ("tournament", game.id)]
+    assert [(event[1], event[2]["reason"]) for event in manager.broadcasts] == [
+        (EventType.GAME_OVER, "disconnect_timeout")
     ]

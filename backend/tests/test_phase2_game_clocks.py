@@ -3,10 +3,20 @@ from uuid import uuid4
 
 import pytest
 
-from domains.game.application.commands import AcceptDrawCommand, DeclineDrawCommand, MakeMoveCommand, OfferDrawCommand
-from domains.game.application.services import DEFAULT_DISCONNECT_GRACE_SECONDS, GameService
+from domains.game.application.commands import (
+    AcceptDrawCommand,
+    DeclineDrawCommand,
+    MakeMoveCommand,
+    OfferDrawCommand,
+)
+from domains.game.application.services import GameService
 from domains.game.domain.entities import Game, Move
-from domains.game.domain.exceptions import DrawOfferNotFound, DrawOfferPending, GameAccessDenied
+from domains.game.domain.exceptions import (
+    DrawOfferNotFound,
+    DrawOfferPending,
+    GameAccessDenied,
+)
+from domains.game.domain.policies import DEFAULT_DISCONNECT_GRACE_SECONDS
 
 
 class InMemoryGameRepository:
@@ -581,3 +591,108 @@ async def test_decline_draw_by_opponent_clears_pending_offer_and_returns_offerer
     assert offerer_id == white_id
     assert declined_game.pending_draw_offer_by_user_id is None
     assert declined_game.pending_draw_offer_at is None
+
+
+@pytest.mark.asyncio
+async def test_black_disconnect_grace_budget_persists_without_changing_white_budget(
+    monkeypatch,
+):
+    repo = InMemoryGameRepository()
+    service = GameService(repo)
+    white_id = uuid4()
+    black_id = uuid4()
+    start = datetime(2026, 4, 13, 12, 45, tzinfo=timezone.utc)
+    game = _make_active_game(white_id, black_id, start)
+    _set_disconnect_budgets(game, white_ms=20_000, black_ms=12_000)
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: start)
+    disconnected_game = await service.mark_disconnected(black_id)
+    assert disconnected_game is game
+    assert game.disconnect_grace_deadline_at == start + timedelta(seconds=12)
+
+    reconnected_at = start + timedelta(seconds=5)
+    monkeypatch.setattr(
+        "domains.game.application.services.utc_now", lambda: reconnected_at
+    )
+    reconnected_game = await service.mark_reconnected(black_id)
+
+    assert reconnected_game is game
+    assert game.status == "active"
+    assert game.disconnected_player_id is None
+    assert game.disconnect_grace_deadline_at is None
+    assert _remaining_disconnect_budget_ms(game, white_id) == 20_000
+    assert _remaining_disconnect_budget_ms(game, black_id) == 7_000
+
+    second_disconnect_at = reconnected_at + timedelta(seconds=2)
+    monkeypatch.setattr(
+        "domains.game.application.services.utc_now", lambda: second_disconnect_at
+    )
+    await service.mark_disconnected(black_id)
+
+    assert game.disconnected_player_id == black_id
+    assert game.disconnect_grace_deadline_at == second_disconnect_at + timedelta(
+        milliseconds=7_000
+    )
+    assert _remaining_disconnect_budget_ms(game, white_id) == 20_000
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_lock_active_game_that_is_not_due(monkeypatch):
+    class LockTrackingRepository(InMemoryGameRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.locked_game_ids = []
+
+        async def get_by_id_for_update(self, game_id):
+            self.locked_game_ids.append(game_id)
+            return await super().get_by_id_for_update(game_id)
+
+    repo = LockTrackingRepository()
+    service = GameService(repo)
+    white_id = uuid4()
+    black_id = uuid4()
+    now = datetime(2026, 4, 13, 12, 1, tzinfo=timezone.utc)
+    game = _make_active_game(white_id, black_id, now)
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: now)
+    finished_games = await service.monitor_active_games()
+
+    assert finished_games == []
+    assert repo.locked_game_ids == []
+    assert game.status == "active"
+
+@pytest.mark.asyncio
+async def test_disconnect_finalization_uses_move_counts_without_loading_full_moves(
+    monkeypatch,
+):
+    class MoveCountOnlyRepository(InMemoryGameRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.move_count_requests = []
+
+        async def get_moves(self, game_id):
+            raise AssertionError("disconnect finalization should not load full moves")
+
+        async def get_move_counts(self, game_ids):
+            self.move_count_requests.append(tuple(game_ids))
+            return {game_id: 2 for game_id in game_ids}
+
+    repo = MoveCountOnlyRepository()
+    service = GameService(repo)
+    white_id = uuid4()
+    black_id = uuid4()
+    start = datetime(2026, 4, 13, 12, 2, tzinfo=timezone.utc)
+    game = _make_active_game(white_id, black_id, start)
+    await repo.create(game)
+
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: start)
+    await service.mark_disconnected(white_id)
+
+    deadline = start + timedelta(seconds=20)
+    monkeypatch.setattr("domains.game.application.services.utc_now", lambda: deadline)
+    finished_games = await service.monitor_active_games()
+
+    assert repo.move_count_requests == [(game.id,)]
+    assert len(finished_games) == 1
+    _assert_disconnect_timeout(finished_games[0], white_id, deadline)
