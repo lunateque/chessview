@@ -211,9 +211,9 @@ The second command is expected to return `401` without an access token.
 
 The `Publish Images` workflow publishes backend and static frontend images to GitHub Container Registry:
 
-- `ghcr.io/tempoloss/chessview-backend`
-- `ghcr.io/tempoloss/chessview-frontend`
-- `ghcr.io/tempoloss/chessview-admin-frontend`
+- `ghcr.io/lunateque/chessview-backend`
+- `ghcr.io/lunateque/chessview-frontend`
+- `ghcr.io/lunateque/chessview-admin-frontend`
 
 ## Troubleshooting
 

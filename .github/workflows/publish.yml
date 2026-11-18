@@ -24,15 +24,15 @@ jobs:
       matrix:
         include:
           - component: backend
-            image: ghcr.io/tempoloss/chessview-backend
+            image: ghcr.io/lunateque/chessview-backend
             context: ./backend
             dockerfile: ./backend/Dockerfile
           - component: frontend
-            image: ghcr.io/tempoloss/chessview-frontend
+            image: ghcr.io/lunateque/chessview-frontend
             context: ./frontend
             dockerfile: ./frontend/Dockerfile
           - component: admin-frontend
-            image: ghcr.io/tempoloss/chessview-admin-frontend
+            image: ghcr.io/lunateque/chessview-admin-frontend
             context: .
             dockerfile: ./admin-frontend/Dockerfile
 

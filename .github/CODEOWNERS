@@ -1,21 +1,21 @@
 # Update these owners as the maintainer group expands.
 # GitHub branch protection can require review from Code Owners.
 
-* @an8kk
+* @lunateque
 
 # Core backend
-/backend/app/ @an8kk
-/backend/domains/ @an8kk
-/backend/infrastructure/ @an8kk
-/backend/shared/ @an8kk
+/backend/app/ @lunateque
+/backend/domains/ @lunateque
+/backend/infrastructure/ @lunateque
+/backend/shared/ @lunateque
 
 # Frontend study/product surface
-/frontend/src/ @an8kk
+/frontend/src/ @lunateque
 
 # Infra, docs, and repo tooling
-/.github/ @an8kk
-/docs/ @an8kk
-/docker-compose.yml @an8kk
-/justfile @an8kk
-/README.md @an8kk
-/CONTRIBUTING.md @an8kk
+/.github/ @lunateque
+/docs/ @lunateque
+/docker-compose.yml @lunateque
+/justfile @lunateque
+/README.md @lunateque
+/CONTRIBUTING.md @lunateque
